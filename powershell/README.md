@@ -1,6 +1,6 @@
 # PowerShell Deobfuscation Toolkit — `TOOLS.md`
 
-A field reference for the 20 utilities in this folder. Each is a thin CLI wrapper over one
+A field reference for the 21 utilities in this folder. Each is a thin CLI wrapper over one
 `Invoke-Ps*` function in the shared library `_PsDeobLib.ps1`. Every utility targets **one**
 obfuscation technique (or performs one supporting cleanup), so you chain them by hand rather than
 running a single do-everything tool.
@@ -22,16 +22,18 @@ running a single do-everything tool.
 | Strings rebuilt via `[string]::Concat(...)` / `[string]::Join(sep,...)` | **PsFold-StaticStringCalls** |
 | Numbers spelled as arithmetic junk: `(18+18-(13-17))+32` | **PsFold-Arithmetic** |
 | Strings built from char codes: `[char]72 + [char]105` | **PsFold-CharConcat** |
-| Strings built from a joined array: `@('ab','cd') -join ''`, `-join @($('ab'),$('cd'))`, or `$x=@();$x+=…;$x -join ''` | **PsFold-ArrayJoins** |
+| Strings built from a joined array: `@('ab','cd') -join ''`, `-join @($('ab'),$('cd'))`, `$x=@();$x+=…;$x -join ''`, or char-selection `("charset")[3,1,4,…] -join ''` | **PsFold-ArrayJoins** |
 | Payload as a numeric array: `[Byte[]]$x = 72,101,108,…` | **PsDecode-ByteArray** |
 | Base64 literal: `[Convert]::FromBase64String("…")` | **PsInline-Base64** |
 | A constant assigned once, then referenced: `$a='calc.exe'; … $a` | **PsInline-Constants** |
 | One variable **reused** to hold a different constant before each call | **PsPropagate-Constants** |
 | Dynamic API/type resolution: `($v -as [Type]).($m)` | **PsResolve-Reflection** |
-| Opaque-predicate dead branches, junk loops / stores / functions | **PsRemove-DeadCode** |
+| Opaque-predicate if that's always **true**: `if (205 -eq 205) { $x = 1 }` | **PsUnwrap-TrueIf** |
+| Opaque-predicate dead branches, junk loops / stores / functions / accumulate-then-discard filler (`$v=@();$v+='x';$v.Clear()`) | **PsRemove-DeadCode** |
 | Lots of blank or `;`-only filler lines | **PsCollapse-BlankLines** |
 | Whole script packed onto one `;`-separated line | **PsExpand-Semicolons** |
-| Comment banners / marker lines to drop | **PsStrip-Lines** |
+| Junk comment banners padding the file: hundreds of `# Gen` lines | **PsStrip-Comments** |
+| Any *other* recognizable filler line to drop | **PsStrip-Lines** |
 | Need a map of variables → decoded values → sinks | **PsExtract-Variables** |
 | Want to apply readable names to garbage identifiers | **PsRename-Variables** |
 | Want to see what an `iex` / `-EncodedCommand` actually runs | **PsAnnotate-Iex** |
@@ -54,9 +56,22 @@ further folds.
 Then:
 
 ```
-RemoveDeadCode → PropagateConstants → FoldArithmetic → FoldCharConcat → ResolveReflection
+UnwrapTrueIf → RemoveDeadCode → PropagateConstants → FoldArithmetic → FoldCharConcat → ResolveReflection
 → CollapseBlankLines → DecodeByteArray → InlineBase64
 ```
+
+Run **PsUnwrap-TrueIf** first: it collapses `if (205 -eq 205) { ... }`-style always-true wrappers
+down to their body, which turns wrapped junk stores into plain dead stores that
+**PsRemove-DeadCode**'s existing dead-store pass then cleans up. Running them in the other order
+misses opaque-true ifs whose body assigns a variable that *is* read elsewhere — PsRemove-DeadCode
+only ever deletes a whole `if`, so a live store trapped in a true-wrapper is otherwise never freed
+from the wrapper.
+
+**PsStrip-Comments** and **PsCollapse-BlankLines** are cosmetic tail passes — run them last, once
+the transforms have stopped changing anything, and run them in that order (stripping comment lines
+leaves blanks behind for the collapser to squeeze). Put both *before* **PsAnnotate-Iex** where you
+can, so the annotation output is the newest thing in the file; running them after is safe too, as
+PsStrip-Comments preserves annotation markers by design.
 
 Run the block, and repeat it until every pass reports `changed:0`. Each pass exposes constants the
 next one needs (e.g. propagation reveals char codes, char-concat folds them into names,
@@ -81,8 +96,12 @@ success — `DispatcherVar`/`TotalCases`/`StatesVisited`/`StepsSimulated`/`State
 
 Exceptions to the two-argument convention:
 - **PsUnflatten-Switch** — also `-MaxSteps <int>` (optional, default `5000`).
+- **PsRemove-DeadCode** — also `-Aggressive` (optional switch, default off; widens the purity
+  allowlist to also remove junk delay/console-output loops and no-op invoked functions).
 - **PsInline-Constants** — also `-MaxUses <int>` (mandatory; `0`/negative = unlimited).
 - **PsDecode-ByteArray** — also `-MinLength <int>` (optional, default `8`).
+- **PsStrip-Comments** — also `-IncludeTrailing` (optional switch) and `-KeepPattern <regex>`
+  (optional). Reports `changed`/`comment_lines_removed`/`trailing_comments_removed`/`comments_kept`.
 - **PsStrip-Lines** — also `-Pattern <regex> -Flags <ims>` (both mandatory).
 - **PsExpand-Semicolons** — also `-IndentString <string>` (optional, default 4 spaces).
 - **PsRename-Variables** — also `-RenamesFile <json>` (mandatory).
@@ -333,8 +352,11 @@ $s = 'Hi!'
 ### How it works
 It finds each outermost `+` chain, resolves every term to a constant (chars, strings, and numbers —
 numbers become their `[char]` code point), concatenates them, and replaces the chain with the
-single-quoted result. It resolves no variables itself, so run **PsInline-Constants** /
-**PsPropagate-Constants** first if the codes are held in variables.
+single-quoted result. Terms may be parenthesized or `$(...)`-wrapped — the real-world shape
+`$(([char]80)+([char]80)+([char]65)+…)` folds identically to the bare `[char]72 + [char]105` form,
+because the "is this a char term?" test is on each term's *resolved value*, not its AST shape. It
+resolves no variables itself, so run **PsInline-Constants** / **PsPropagate-Constants** first if the
+codes are held in variables.
 
 ---
 
@@ -343,11 +365,15 @@ single-quoted result. It resolves no variables itself, so run **PsInline-Constan
 ### Description
 Folds string arrays that are assembled with `-join`. Handles the **inline** binary form
 `@('a','b',…) -join 'sep'`, the **inline unary** form `-join @('a','b',…)` (prefix operator, empty
-separator), and the **accumulator** idiom `$v=@(); $v+='a'; $v+='b'; … $v -join 'sep'`. Array
-elements need only be constant-*foldable* — bare literals, `$('x')`/`('x')` subexpression wrappers,
-`+`-concatenations, and pure string-method chains all resolve. Malware uses this to keep a long
-base64 blob as many small quoted fragments, and wraps individual literals in `-join @($('x'))` as a
-no-op specifically to defeat receiver-must-be-constant folds like **PsFold-MethodChains**.
+separator), the **accumulator** idiom `$v=@(); $v+='a'; $v+='b'; … $v -join 'sep'`, and the
+**char-selection** form `("charset")[3,1,4,…] -join 'sep'` — a constant string indexed by a list of
+integer positions, spelling a name out of a scrambled alphabet (e.g.
+`("…Get…")[9,2,17,0,15,8,22,17,2,22,17] -join '' → 'Get-Content'`; negative indices follow
+PowerShell semantics, out-of-range positions are left untouched). Array elements need only be
+constant-*foldable* — bare literals, `$('x')`/`('x')` subexpression wrappers, `+`-concatenations,
+and pure string-method chains all resolve. Malware uses this to keep a long base64 blob as many
+small quoted fragments, and wraps individual literals in `-join @($('x'))` as a no-op specifically
+to defeat receiver-must-be-constant folds like **PsFold-MethodChains**.
 
 ### Examples
 Input:
@@ -529,6 +555,39 @@ fold passes) so the type/member variables are known.
 
 ---
 
+## PsUnwrap-TrueIf
+
+### Description
+Collapses an `if` statement whose condition is a statically-**true** tautology down to just its
+body — the opaque-predicate counterpart to a false condition (which **PsRemove-DeadCode** already
+deletes outright). Only handles the unambiguous case: a single clause, no `elseif`/`else`. Complex
+or unresolvable conditions are left untouched.
+
+### Examples
+Input:
+```powershell
+if (205 -eq 205) { $key = "FrsnYjHYk" }
+if ($env:USERNAME -eq "x") { Write-Output "real branch" }
+```
+Output (`changed:1`):
+```powershell
+$key = "FrsnYjHYk"
+if ($env:USERNAME -eq "x") { Write-Output "real branch" }
+```
+
+### How it works
+Parses the script, and for each single-clause/no-else `if` resolves the condition via the same
+`Resolve-Const` constant-folder the rest of the library uses (so `205 -eq 205`, `5 -gt 3`, `$true`,
+non-empty string literals, etc. are all recognized). When the condition is provably truthy, the
+whole `if` statement's text is replaced by just its body's statement text — safe because `if`
+blocks are not scope boundaries in PowerShell, so lifting the body out changes nothing about which
+scope its assignments land in. Run it **before** PsRemove-DeadCode (see recommended chain above):
+it turns "wrapped junk store" into "plain dead store," which PsRemove-DeadCode's dead-store pass
+then removes; without it, a true-wrapper around a *live* store is never freed from its wrapper at
+all, since PsRemove-DeadCode only ever deletes whole `if` statements.
+
+---
+
 ## PsRemove-DeadCode
 
 ### Description
@@ -556,10 +615,233 @@ Write-Host 'real payload'
 ### How it works
 It parses the script, builds a variable read/write graph, and works a queue: a store whose target is
 never read (outside dead regions) is removed, which can make *its* inputs dead too, and so on to a
-fixpoint. Loops/ifs with statically-false conditions are dropped outright. Crucially, a loop whose
-result is **captured** by an enclosing `$(...)`/`@(...)` (e.g. an XOR-decrypt loop feeding a payload)
-is recognised as live and never removed. Constant/number/string RHS assignments are kept via the
-built-in `PreserveStringLiterals` guard.
+fixpoint. Loops/ifs with statically-false conditions are dropped outright — this includes `foreach`
+loops whose collection is provably `$null` (a literal `$null` or a variable never assigned anywhere in
+the script); a `foreach` over any array/range/live variable is left untouched, by construction (the
+constant-folder has no notion of array contents, so it can only ever resolve the collection to `$null`,
+never mistake a real array for empty). Crucially, a loop whose result is **captured** by an enclosing
+`$(...)`/`@(...)` (e.g. an XOR-decrypt loop feeding a payload) is recognised as live and never removed.
+Constant/number/string RHS assignments are kept via the built-in `PreserveStringLiterals` guard.
+
+Two further safeguards keep genuinely-live loops from being mistaken for filler. First, assignment to an
+**index or member target** (`$arr[$i] = …`, `$obj.Prop = …`, and their compound forms) is treated as a
+side effect — such a write mutates an array/object that may be read elsewhere and is *not* tracked by
+the variable-name liveness (its target is not a plain `$var`). So a decode/transform loop like
+`for ($i = 0; $i -lt $n; $i++) { $out[$i] = $data[$i] -bxor $k }` is preserved even when its own
+counter is otherwise dead — a structural complement to the `$(...)/@(...)`-capture rule above. Second, a
+variable referenced by **name** via the `*-Variable` cmdlets (`Get-Variable`/`Set-Variable`/
+`Clear-Variable`/`Remove-Variable`/`New-Variable`) is a plain string, invisible to the `$var` read
+scan; it is conservatively treated as live everywhere, so its store or loop is never removed — in both
+default and `-Aggressive` mode. (A variable reached by a *dynamically built* name — via
+`Invoke-Expression` or `$ExecutionContext.SessionState.PSVariable` — is a genuine static-analysis
+ceiling and remains undecidable, same as for any pass here.)
+
+Reads are only ever marked "covered" (excluded from liveness) once a construct is *actually* confirmed
+removed — never pre-emptively just for looking pure. This matters for kept loops: e.g. an accumulator
+`while ($i -lt $data.Count) { $sum += $data[$i]; $i++ }` that survives (because `$sum` is read later)
+must not cause `$data`'s or `$i`'s assignment elsewhere to look dead.
+
+A store to `$null` (e.g. `$null = [Math]::Sqrt($x)`, PowerShell's documented discard idiom) is always
+removed once its right-hand side is itself pure, regardless of `$null` reads elsewhere in the script —
+`$null` is a reserved automatic variable that can never actually carry data from one assignment to a
+later read, so tracking it as an ordinary variable name would create a false liveness dependency on
+totally unrelated `$null` usage elsewhere in a large file. This is a correctness fix, not a leniency:
+`HasImpureCommand` still gates it exactly as strictly as any other store, so `$null = Invoke-WebRequest
+...` (a real side-effecting call) is never touched. Note this only clears the discarded computation
+itself — the *loop* it sits inside (if any) is a separate decision; a `foreach` loop is only removed as
+a whole under `-Aggressive` (see below).
+
+A standalone discarded statement (the "pure statement" pass) is recognized at **any** real statement
+position — root script or any function body, at any nesting depth (a `try`/`if`/`while`/`for`/`foreach`
+block) — not just true script-root. It is still never reached for a statement sitting inside a
+scriptblock **literal** passed as a value/callback (e.g. `ForEach-Object { ... }`, `$sb = { ... }`),
+since that's a deferred delegate body rather than normal sequential flow; nor for a statement whose value
+is actually consumed by an enclosing capture context (e.g. the emitted expression inside a captured
+`$x = foreach(...) { $i * 2 }`) — both exclusions are load-bearing, not incidental. A small, explicit
+allowlist additionally recognizes `[System.Text.Encoding]::<X>.GetBytes(...)`/`.GetString(...)` as pure
+regardless of how the result is consumed (assigned, `[void]`-cast, or bare-discarded) — e.g.
+`[void]([System.Text.Encoding]::UTF8.GetBytes("..."))` filler. This is deliberately narrow: it is **not**
+"any `[void](...)` call is pure" (that would wrongly sweep up e.g. `[void]$sb.Append("x")`, where
+`[void]` only suppresses a fluent return value while `Append` has a real, intended mutating effect) —
+only this specific, known-pure static-property-then-instance-method shape is recognized, and only when
+its **arguments** are themselves side-effect-free (a nested `GetString($sb.Append(...))` or
+`GetString([IO.File]::ReadAllBytes(...))` is kept, so the argument's side effect is never discarded
+along with the call). This preserve-all-method-mutations stance holds in default mode and for any
+receiver whose contents escape; under `-Aggressive` a **bare** mutator call *is* removable, but only
+for a fresh-confined, unaliased local (see the aggressive cluster below) — the `[void]$sb.Append("x")`
+case above stays preserved precisely because `$sb`'s built-up value is value-consumed / escapes.
+
+Increment and decrement (`$x++`, `$x--`, `++$x`, `--$x`) mutate their operand, so a **bare** `$x++`
+standalone statement is never removed as a "pure statement" (that would silently change `$x` if it is
+read later). A **loop's own bookkeeping increment**, however — the `$i++` iterator of a `for`, or a
+`$counter++` in a `while` body — does *not* by itself keep the loop alive: the loop is removed when
+liveness shows the incremented variable is dead everywhere else (e.g. an empty
+`for ($i = 0; $i -lt 8; $i++) { }` or a junk `while ($counter -lt 5) { $counter++ }`). This is
+**default** behavior. What still counts as a real side effect and keeps the loop: any increment of a
+variable the loop does **not** itself own — a scoped/global name (`$global:hits++`) or one written
+outside the loop — and any non-variable increment target (`$arr[0]++`). The variable-name liveness
+check makes the distinction, so a loop whose counter *is* read after it is always kept.
+
+### `-Aggressive` (optional switch, default off)
+Off by default so behavior across samples never changes unless you opt in — being wrong about
+"dead" on a live-malware variant is a real cost, so this stays conservative unless asked otherwise.
+`-Aggressive` does **not** widen the command-purity allowlist at all — `Start-Sleep`/`sleep` and every
+other command are treated identically to default mode in every version of this tool. A delay loop like
+`foreach($i in 1..2){ Start-Sleep -Milliseconds 1 }` is real, observable program behavior (timing),
+not meaningless filler, and is never removed by this tool, in either mode. `-Aggressive` only enables
+three structural leniencies, all still gated by the same liveness/value-consumed checks as default mode:
+- **`foreach` loops join the purity-based "non-functional loop" removal.** By default a `foreach` is
+  only ever removed via the provably-`$null`-collection case above; under `-Aggressive` a `foreach`
+  that is otherwise pure (no commands at all in its body) and not value-consumed can also be removed as
+  dead — e.g. a leftover `foreach ($y in $x) { }` with a fully empty body.
+- **No-op invoked functions are fully removed.** A function whose body is provably effect-free is
+  removed — definition *and* every call site — **only if every call site is itself a discarded
+  statement** (never assigned, piped, redirected, or captured by `$(...)`/`@(...)`; a single
+  value-consuming call keeps the whole function).
+
+  "Effect-free" is judged by a **function-body-specific** rule, not the same one used for `if` bodies.
+  A `return` is *allowed* here: a function body is its own scope boundary, so `return` just means
+  "emit this value and leave", whereas a `return` inside an `if` body is real control flow for the
+  enclosing function and still disqualifies it. This is what makes the extremely common junk shape
+  below removable — it is emitted by the hundred (820 copies in one 2.7 MB sample), and every copy
+  *is* invoked, so the default never-referenced-function pass never sees it:
+  ```powershell
+  function ghDatoK([int]$XEUvdORLgzfTzoqs) { return $XEUvdORLgzfTzoqs + 0 }
+  ghDatoK 2
+  ```
+  A bare value-emitting statement (`$x + 0` with no `return`) is treated the same way — it is the
+  implicit-output spelling of the same thing, and the default "pure statement" pass already removes a
+  bare `$x` / `"literal"` statement anyway.
+
+  What still disqualifies a body: any non-allowlisted command, index/member assignment, statement-level
+  .NET method call, or `++`/`--` (the shared purity oracle); a write to a `global:`/`script:`/`env:`/
+  `using:` name; `throw`, `exit`, or `trap`; a `break`/`continue` **not bound** to a loop or switch
+  inside that same body (an unbound one propagates into the *caller's* loop — a real effect), or any
+  labeled jump; a `begin`/`process`/`dynamicparam` block; and an impure **parameter default value or
+  attribute** (`function f($x = (Get-Date))`, `[ValidateScript({ … })]`) — these live outside the body
+  and are checked separately.
+
+  Three further guards make the deletion safe on live-malware variants:
+  - **Every definition sharing the name must qualify.** Obfuscators reuse a small pool of names (83
+    distinct names across 821 definitions in that sample), and call sites belong to the *name*, not to
+    one definition — so one impure `function f { Write-Host x }` keeps every `f`.
+  - **Call-site arguments must be side-effect-free.** Deleting the call deletes its arguments too, so
+    `f (Get-Content x)` is kept.
+  - **A name occurring in any quoted string literal is skipped entirely**, since it may be dispatched
+    dynamically (`& "f"`, `iex "f 2"`) where the call-site scan cannot see it.
+- **Whole-variable ("faint variable") cluster removal.** The default liveness is *incremental* — it can
+  only remove a construct once every external read of its variable is already gone — so a group of
+  otherwise-pure loops/stores that merely read and write *each other's* shared local variables forms a
+  mutual-reference cycle that never bootstraps and survives intact (e.g. a run of
+  `while ($counter -lt N) { $counter++ }` loops, or `for ($j…) { $final += $j }` loops, where `counter`
+  / `j` / `final` are used nowhere else). Under `-Aggressive` these are reasoned about per *variable*: a
+  connected component of candidates sharing any written variable is removed **only when every variable
+  it touches is confined to the component** — i.e. every read of each lies inside one of that variable's
+  own writers. A single escaping read keeps the entire cluster — one `Write-Output $final`, a scoped
+  name, or a `Get-Variable`-referenced name anywhere makes that variable non-confined and preserves all
+  its writers.
+
+  Under `-Aggressive` a cluster "writer" is no longer only a plain store or loop — two further writer
+  shapes join, which is what finally removes the common **accumulate-then-discard** filler
+  `$v = @(); $v += 'x'; $v.Clear()` (whole trios of which malware emits by the hundred):
+  - a **compound assignment** (`$v += …`, `-=`, …) — admitted with no extra guard, because `+=`
+    *rebinds* `$v` to a freshly-computed value and so can never mutate an object that some other name
+    also holds. (An impure RHS like `$v += (Get-Foo)` is still rejected by the usual purity gate.)
+  - a **bare receiver-only mutator call** (`$v.Clear()`, `$v.Add(...)`) — a method call is otherwise
+    always treated as impure, so this is admitted only under a tight set of guards: the receiver is a
+    plain local variable, the arguments are side-effect-free, and the receiver is **fresh-confined** —
+    *every* `=` assignment to it in the whole script binds a freshly-constructed value (`@()`, `@{}`,
+    `New-Object`, `[T]::new(...)`, or a constant), so its object can never have been aliased **in** from
+    another name. The method must be on a deliberately narrow allowlist —
+    `Add`/`AddRange`/`Clear`/`Insert`/`InsertRange`/`Remove`/`RemoveAt`/`RemoveRange`/`Push`/`Enqueue`/
+    `Append`/`AppendLine` — of methods that mutate *only the receiver* and never write back through an
+    argument (methods like `.CopyTo(arr, i)` / `.TryGetValue(k, [ref]o)`, which mutate an argument, are
+    excluded); any other method is left in place.
+
+  The two safeguards compose to make an in-place mutation safe to delete: the existing "a single
+  escaping read keeps the whole cluster" rule closes aliasing **out** (`$other = $v` is a read of `$v`
+  and pins it), and fresh-confinement closes aliasing **in**, so a removed mutator's object is provably
+  reachable through exactly one name and the mutation is unobservable. The canonical failure it
+  correctly *rejects*: `$alias = $orig; $alias.Add(...)` — `$alias` has a non-fresh `=` (it copies
+  `$orig`'s reference), so it is not fresh-confined, its mutator call is never removable, and the whole
+  cluster is pinned.
+
+  Reason strings: a mutator call or store removed as part of a component is reported as
+  **`dead variable cluster`**; a compound assignment removed on its own (via the incremental
+  work-queue) reports as **`dead store`**, and a bare mutator call removed on its own reports as
+  **`dead mutator call`**.
+
+`PreserveStringLiterals`, the index/member-write and `*-Variable`-name guards, and the
+value-consumed/XOR-loop protection are all unaffected by this switch — they hold in both modes.
+
+### Examples (`-Aggressive`)
+Input:
+```powershell
+foreach ($i in 1..2) { Start-Sleep -Milliseconds 1 }
+function NoOp { $x = @(1,2,3); foreach ($y in $x) { } }
+NoOp
+function ghDatoK([int]$XEUvdORLgzfTzoqs) { return $XEUvdORLgzfTzoqs + 0 }
+ghDatoK 2
+Write-Host 'real payload'
+```
+Output (`changed:6` — `4x no-op function, 2x dead variable cluster`; the 4 no-op entries are the two
+functions plus their two call sites, and the cluster entries are `NoOp`'s own internals, already
+subsumed by its removal — reported separately since they're also independently valid candidates, but
+the overlapping ranges coalesce into one correct edit):
+```powershell
+foreach ($i in 1..2) { Start-Sleep -Milliseconds 1 }
+
+
+
+
+Write-Host 'real payload'
+```
+
+Whole-variable cluster removal — the mutually-referencing loops collapse, but the one whose accumulator
+escapes is kept:
+```powershell
+while ($counter -lt 2) { $counter++ }
+while ($counter -lt 5) { $counter++ }
+for ($j = 0; $j -lt 4; $j++) { $sum += $j }
+Write-Output $sum
+Write-Host 'real payload'
+```
+Output (`changed:2` — `2x dead variable cluster`): both `while` loops go (nothing reads `counter`), but
+the `for` loop stays because `$sum` is read by `Write-Output`:
+```powershell
+
+
+for ($j = 0; $j -lt 4; $j++) { $sum += $j }
+Write-Output $sum
+Write-Host 'real payload'
+```
+
+Accumulate-then-discard filler — the whole `= @()` / `+=` / mutator-call trio collapses because the
+variable is fresh-confined and read nowhere else, while real code beside it is untouched:
+```powershell
+$DJSKTCgBExWzaLeS = @()
+$DJSKTCgBExWzaLeS += "bfPL"
+$DJSKTCgBExWzaLeS.Clear()
+Write-Host 'real payload'
+```
+Output (`changed:3` — `3x dead variable cluster`):
+```powershell
+
+
+
+Write-Host 'real payload'
+```
+
+The aliasing guard keeps this from touching a mutation that another name can observe — here `$alias`
+copies `$orig`'s reference (a non-fresh `=`), so it is not fresh-confined and its `.Add` is never
+removable:
+```powershell
+$orig  = New-Object System.Collections.ArrayList
+$alias = $orig
+$alias.Add("critical")
+Write-Output $orig
+```
+Output (`changed:0`): left completely untouched.
 
 ---
 
@@ -626,6 +908,64 @@ It walks the **token stream** (not raw text), emitting a newline at each stateme
 semicolon or line break and increasing indent inside `{ … }`. Because it works on tokens,
 semicolons *inside strings* are never mistaken for statement separators. Indent width is
 configurable via `-IndentString`.
+
+---
+
+## PsStrip-Comments
+
+### Description
+Removes lines that are nothing but a comment. Obfuscators pad samples with hundreds of junk banner
+lines (one real sample: 700 of its 1805 lines were `# Gen` and friends), and this deletes them
+without touching a single code token. Unlike **PsStrip-Lines**, it is driven by the parser's token
+stream, so a `#` inside a here-string is never mistaken for a comment.
+
+By default only *comment-only* lines go — a comment after real code stays. `-IncludeTrailing` also
+strips end-of-line comments, keeping the code and the newline.
+
+Always preserved, even alone on a line:
+- `#requires …` — a real directive PowerShell acts on; deleting it changes how the script runs.
+- `#!` shebang.
+- **PsAnnotate-Iex** output (`# <<<IEX PAYLOAD BEGIN>>>`, `# > …`), so this pass never throws away
+  a payload another tool just recovered.
+- Anything matching your optional `-KeepPattern <regex>`.
+
+### Examples
+Input:
+```powershell
+#requires -Version 5
+# Gen
+    # kFwI
+$a = 1  # trailing junk
+<#
+  junk block
+#>
+$b <#x#> = 2
+```
+Output (`changed:3`, `comment_lines_removed:3`, `comments_kept:3`):
+```powershell
+#requires -Version 5
+$a = 1  # trailing junk
+$b <#x#> = 2
+```
+With `-IncludeTrailing` (`changed:4`, `trailing_comments_removed:1`, `comments_kept:2`),
+`$a = 1  # trailing junk` becomes `$a = 1`.
+
+Chained with **PsCollapse-BlankLines**, the 1805-line sample above drops to 655 lines (358
+substantive) with an identical code-token stream.
+
+### How it works
+It parses the file and takes the extents of every `Comment` token — including multi-line `<# … #>`
+blocks, whose extent already spans all their lines. A `#` inside a string or here-string is not a
+comment token, so string data is safe **by construction**; that is the difference from
+**PsStrip-Lines**, whose blind `^\s*#` line filter would silently gut a here-string payload. Reach
+for PsStrip-Lines only when you need to drop non-comment filler.
+
+For each removable comment it decides between two shapes: *line-leading* (only whitespace before it)
+deletes the indent, comment and newline together; *trailing* deletes the whitespace and comment but
+keeps the newline. An inline block comment with code after it (`Write-Host<#x#>hi`) is skipped
+outright — removing it would fuse two tokens into one. Edits are applied by offset over the raw
+text, so mixed CRLF/LF line endings and the final-newline state survive byte-for-byte. Re-running is
+a no-op (`changed:0`, byte-identical output).
 
 ---
 

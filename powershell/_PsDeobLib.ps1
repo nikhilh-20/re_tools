@@ -37,6 +37,17 @@ $script:CffAllowedStringMethods = @{
     'TrimEnd'   = { param($s,$a) if ($a.Count -eq 0) { $s.TrimEnd() } else { $s.TrimEnd([char[]]$a) } }
 }
 
+# Instance methods whose only mutation is to the RECEIVER's own object — the arguments are read-only
+# inputs, never written back through (unlike e.g. .CopyTo(arr,i)/.TryGetValue(k,[ref]o), which mutate
+# an argument and are deliberately excluded). Used by the aggressive dead-code pass to recognize a
+# bare `$v.Clear()` / `$v.Add(...)` mutator statement as a removable "writer" of $v — but ONLY when $v
+# is provably a fresh, unaliased local (see Test-FreshConfinedVar), so that mutating its object can
+# never be observed anywhere else. Kept narrow on purpose: a name not on this list is simply left in
+# place (a missed deobfuscation, never a corruption).
+$script:PsReceiverOnlyMutators = [System.Collections.Generic.HashSet[string]]([System.StringComparer]::OrdinalIgnoreCase)
+@('Add','AddRange','Clear','Insert','InsertRange','Remove','RemoveAt','RemoveRange',
+  'Push','Enqueue','Append','AppendLine') | ForEach-Object { [void]$script:PsReceiverOnlyMutators.Add($_) }
+
 # ---------------------------------------------------------------------------
 # Stateless helpers (module-level, usable by any pass)
 # ---------------------------------------------------------------------------
@@ -57,13 +68,113 @@ function Expand-SemiDeleteRange([string]$raw, [int]$start, [int]$end) {
     return [pscustomobject]@{ Start = $start; End = $end }
 }
 
-function Test-HasImpureCommand($astNode) {
+# A small, explicit allowlist of .NET methods known to be pure (no I/O, no mutation, deterministic)
+# regardless of how their result is consumed (assigned, [void]-cast, or a bare discarded statement).
+# Deliberately narrow — NOT "any [void](...) call is pure": that would wrongly exempt e.g.
+# [void]$sb.Append(...), where Append has a real, intended mutating side effect and [void] only
+# suppresses its fluent return value. Only matches the literal `[System.Text.Encoding]::X.GetBytes/
+# GetString(...)` static-property-then-instance-method shape, never an arbitrary variable's method of
+# the same name (e.g. a custom encoder held in a variable).
+function Test-PureNetMethodInvoke($inv) {
+    $name = if ($inv.Member -is [System.Management.Automation.Language.StringConstantExpressionAst]) { $inv.Member.Value } else { $null }
+    if ($null -eq $name -or $name -notin @('GetBytes','GetString')) { return $false }
+    $recv = $inv.Expression
+    if ($recv -isnot [System.Management.Automation.Language.MemberExpressionAst] -or -not $recv.Static) { return $false }
+    if ($recv.Expression -isnot [System.Management.Automation.Language.TypeExpressionAst]) { return $false }
+    if ($recv.Expression.TypeName.FullName -notmatch '(?i)^(System\.Text\.)?Encoding$') { return $false }
+    # The method is pure, but its ARGUMENTS still execute — a side effect nested in an argument
+    # (e.g. GetString($sb.Append(...)) or GetString([IO.File]::ReadAllBytes(...))) must NOT be
+    # discarded along with the call. Require every argument to be side-effect-free: no command
+    # calls, and no method invocations other than further allowlisted-pure ones. The receiver is
+    # safe by construction — it can only be a static property access on the Encoding type.
+    if ($null -ne $inv.Arguments) {
+        foreach ($arg in $inv.Arguments) {
+            if (($arg.FindAll({ param($n) $n -is [System.Management.Automation.Language.CommandAst] }, $true)).Count -gt 0) { return $false }
+            foreach ($m in $arg.FindAll({ param($n) $n -is [System.Management.Automation.Language.InvokeMemberExpressionAst] }, $true)) {
+                if (-not (Test-PureNetMethodInvoke $m)) { return $false }
+            }
+        }
+    }
+    return $true
+}
+
+# Is an assignment RHS a "fresh" value — a newly-constructed or immutable object that cannot already
+# be referenced through another name? Fresh: literals/constants, @(...) / 1,2,3 / @{...},
+# `New-Object ...`, and `[Type]::new(...)`. Deliberately conservative: anything else (a bare `$other`,
+# a cast, a method result, a command result) returns $false, meaning "may alias an external object".
+# Returning $false only ever KEEPS more code, so unrecognized-but-actually-fresh forms are safe misses.
+# Handles both AST shapes for the RHS: PipelineAst (PS7) and a bare CommandExpressionAst/CommandAst
+# (Windows PowerShell 5.1).
+function Test-FreshValueRhs($rightAst) {
+    $expr = $null; $cmd = $null
+    if ($rightAst -is [System.Management.Automation.Language.PipelineAst]) {
+        if ($rightAst.PipelineElements.Count -ne 1) { return $false }
+        $el = $rightAst.PipelineElements[0]
+        if ($el -is [System.Management.Automation.Language.CommandExpressionAst]) { $expr = $el.Expression }
+        elseif ($el -is [System.Management.Automation.Language.CommandAst]) { $cmd = $el }
+        else { return $false }
+    } elseif ($rightAst -is [System.Management.Automation.Language.CommandExpressionAst]) {
+        $expr = $rightAst.Expression
+    } elseif ($rightAst -is [System.Management.Automation.Language.CommandAst]) {
+        $cmd = $rightAst
+    } else { return $false }
+
+    if ($null -ne $cmd) { return ($cmd.GetCommandName() -eq 'New-Object') }
+
+    if ($expr -is [System.Management.Automation.Language.ArrayExpressionAst])  { return $true }   # @(...)
+    if ($expr -is [System.Management.Automation.Language.ArrayLiteralAst])     { return $true }   # 1,2,3
+    if ($expr -is [System.Management.Automation.Language.HashtableAst])        { return $true }   # @{...}
+    if ($expr -is [System.Management.Automation.Language.ConstantExpressionAst] -or
+        $expr -is [System.Management.Automation.Language.StringConstantExpressionAst]) { return $true }
+    if ($expr -is [System.Management.Automation.Language.InvokeMemberExpressionAst] -and $expr.Static) {
+        $m = $expr.Member
+        if ($m -is [System.Management.Automation.Language.StringConstantExpressionAst] -and $m.Value -eq 'new') { return $true }  # [T]::new(...)
+    }
+    return $false
+}
+
+# A local variable is "fresh-confined" when EVERY `=` assignment to it in the whole script binds a
+# fresh value (Test-FreshValueRhs). Then the object the name holds can never have been aliased IN from
+# another name. Combined with the caller's escape check (any read of the name outside its own writers
+# pins it, which catches aliasing OUT), this proves the object is reachable through this one name only
+# — so deleting an in-place mutation of it (e.g. a bare `$v.Clear()`) is unobservable. Requires at
+# least one such `=` initializer: a name only ever mutated but never `=`-initialized in-script may
+# hold a parameter/outer-scope object and is treated as NOT confined.
+function Test-FreshConfinedVar([string]$name, $assignNodes) {
+    $sawFreshInit = $false
+    foreach ($a in $assignNodes) {
+        if ($a.Operator.ToString() -ne 'Equals') { continue }
+        if ($a.Left -isnot [System.Management.Automation.Language.VariableExpressionAst]) { continue }
+        if ((Get-VarName $a.Left) -ne $name) { continue }
+        if (-not (Test-FreshValueRhs $a.Right)) { return $false }
+        $sawFreshInit = $true
+    }
+    return $sawFreshInit
+}
+
+function Test-HasImpureCommand($astNode, $OwnedIncrementVars = $null) {
     foreach ($cmd in $astNode.FindAll({ param($n) $n -is [System.Management.Automation.Language.CommandAst] }, $true)) {
         $name = $cmd.GetCommandName()
-        if ($null -eq $name -or -not $pureCommands.Contains($name)) { return $true }
+        if ($null -eq $name) { return $true }
+        if ($pureCommands.Contains($name)) { continue }
+        return $true
+    }
+    # Assignment to an index or member target (`$arr[$i] = ...`, `$obj.Prop = ...`, and their compound
+    # forms) MUTATES aliased state — the array/object may be referenced elsewhere, and the write is not
+    # tracked by the variable-name liveness (AssignmentStatementAst.Left is an Index/MemberExpressionAst,
+    # not a VariableExpressionAst, so it never enters AssignedVars). Without treating it as impure, a
+    # loop whose only body is such a write (e.g. an XOR-decode `for(;;$i++){ $out[$i] = ... }`) would
+    # look purely bookkeeping once its own `$i++` stops counting, and be deleted as a "non-functional
+    # loop" even though it produces $out. Flag it here so every purity gate keeps such constructs.
+    foreach ($asgn in $astNode.FindAll({ param($n) $n -is [System.Management.Automation.Language.AssignmentStatementAst] }, $true)) {
+        $lhs = $asgn.Left
+        while ($lhs -is [System.Management.Automation.Language.ConvertExpressionAst]) { $lhs = $lhs.Child }
+        if ($lhs -is [System.Management.Automation.Language.IndexExpressionAst] -or
+            $lhs -is [System.Management.Automation.Language.MemberExpressionAst]) { return $true }
     }
     # Statement-level .NET method invocations have side effects (e.g. $fs.Write(...), $fs.Dispose())
     foreach ($inv in $astNode.FindAll({ param($n) $n -is [System.Management.Automation.Language.InvokeMemberExpressionAst] }, $true)) {
+        if (Test-PureNetMethodInvoke $inv) { continue }
         $p = $inv.Parent
         while ($p -is [System.Management.Automation.Language.ConvertExpressionAst]) { $p = $p.Parent }
         if ($p -is [System.Management.Automation.Language.CommandExpressionAst]) {
@@ -76,8 +187,43 @@ function Test-HasImpureCommand($astNode) {
             }
         }
     }
+    # Pre/post increment and decrement (`$x++`, `--$x`) MUTATE their operand — a real side effect,
+    # not a pure discardable expression. Without this, the pure-statement pass would delete a bare
+    # `$x++` even when $x is read afterward (silently changing its value), and the loop/dead-store
+    # classifiers would treat an increment-only construct as removable. Flagged here so every
+    # consumer (pure statements, loops, dead stores, effect-free-block checks) treats them uniformly.
+    #
+    # $OwnedIncrementVars (loop gate only): a set of the *local* variable names a loop assigns as its
+    # own bookkeeping (iterator/accumulator). An increment of one of those (`$i++` in `for(;;$i++)`,
+    # `$counter++` in a while body) is not an externally-observable side effect — whether it matters is
+    # already decided by the caller's AssignedVars liveness check, which keeps the loop if the var is
+    # read elsewhere. So for that caller we skip owned-local increments here instead of reflexively
+    # disqualifying the whole loop. Every other caller passes $null and keeps the original strict
+    # behavior. Increments of a non-owned or scoped name (e.g. `$global:hits++`) stay impure, and a
+    # non-variable operand (`$arr[0]++`) is never "owned" and stays impure.
+    foreach ($u in $astNode.FindAll({ param($n) $n -is [System.Management.Automation.Language.UnaryExpressionAst] }, $true)) {
+        if ($u.TokenKind.ToString() -in @('PlusPlus','MinusMinus','PostfixPlusPlus','PostfixMinusMinus')) {
+            if ($null -ne $OwnedIncrementVars -and
+                $u.Child -is [System.Management.Automation.Language.VariableExpressionAst] -and
+                $OwnedIncrementVars.Contains((Get-VarName $u.Child))) { continue }
+            return $true
+        }
+    }
     return $false
 }
+
+# Condition-owning statement types: a PipelineAst whose immediate .Parent is one of these directly
+# (never a StatementBlockAst/NamedBlockAst) is that statement's own condition/collection syntax, not
+# a discarded body statement — e.g. the `$arr` in `foreach ($y in $arr)`.
+$script:ConditionOwnerAstTypes = @(
+    [System.Management.Automation.Language.IfStatementAst],
+    [System.Management.Automation.Language.WhileStatementAst],
+    [System.Management.Automation.Language.DoWhileStatementAst],
+    [System.Management.Automation.Language.DoUntilStatementAst],
+    [System.Management.Automation.Language.ForStatementAst],
+    [System.Management.Automation.Language.ForEachStatementAst],
+    [System.Management.Automation.Language.SwitchStatementAst]
+)
 
 function Test-EffectFreeBlock($blockAst) {
     if ($null -eq $blockAst) { return $true }
@@ -96,8 +242,19 @@ function Test-EffectFreeBlock($blockAst) {
         $parent = $node.Parent
         if ($parent -is [System.Management.Automation.Language.PipelineAst]) {
             $gp = $parent.Parent
-            if (-not ($gp -is [System.Management.Automation.Language.AssignmentStatementAst] -and
-                      $gp.Right -eq $parent)) {
+            # A bare discarded expression only "counts" against effect-freedom when it sits in a real
+            # statement position. Array-literal elements (`1,2,3` in `@(1,2,3)`) and a loop/if/switch's
+            # own condition/collection syntax reuse the same node types but are not executed,
+            # value-discarding statements — exempt both alongside the existing assignment-RHS case.
+            $isAssignmentRhs = ($gp -is [System.Management.Automation.Language.AssignmentStatementAst] -and
+                                 $gp.Right -eq $parent)
+            $isArrayLiteralData = ($gp -is [System.Management.Automation.Language.StatementBlockAst] -and
+                                    $gp.Parent -is [System.Management.Automation.Language.ArrayExpressionAst])
+            $isConditionSlot = $false
+            foreach ($ty in $script:ConditionOwnerAstTypes) {
+                if ($gp -is $ty) { $isConditionSlot = $true; break }
+            }
+            if (-not $isAssignmentRhs -and -not $isArrayLiteralData -and -not $isConditionSlot) {
                 return $false
             }
         }
@@ -110,6 +267,106 @@ function Test-EffectFreeBlock($blockAst) {
         }
     }
     return $true
+}
+
+# Function-body variant of the effect-free test, used ONLY by the aggressive no-op-function pass.
+# Test-EffectFreeBlock (above) is deliberately left untouched: its other caller ($ifNodes) needs the
+# strict rule that a `return`/`break`/`continue` inside an `if` body is real control flow for the
+# ENCLOSING function. A function body is a different scope boundary — `return` there just means
+# "emit this value and leave the function", which is precisely the behavior the no-op pass is
+# deleting (every call site is already proven result-discarded before this predicate matters). So
+# `return` is allowed here, and so is a bare value-emitting statement (`$x + 0` with no `return`),
+# the implicit-output spelling of the same thing — consistent with the pure-statement pass, which
+# already removes a bare `$x` / `"literal"` statement in DEFAULT mode.
+#
+# Takes the FunctionDefinitionAst, not just the body: short-form parameters (`function f($a = …)`)
+# hang off .Parameters, OUTSIDE .Body, so a body-only scan never sees their default values or
+# attribute arguments. Everything below is a rejection — an unrecognized shape returns $false, which
+# only ever KEEPS the function (a missed deobfuscation, never a corruption).
+function Test-EffectFreeFunctionBody($fnAst) {
+    if ($null -eq $fnAst) { return $false }
+    $body = $fnAst.Body
+    if ($null -eq $body) { return $false }
+
+    # Pipeline-aware functions have per-object begin/process/end semantics this analysis does not
+    # model, and a dynamicparam block runs arbitrary code at binding time.
+    if ($null -ne $body.DynamicParamBlock -or
+        $null -ne $body.BeginBlock -or
+        $null -ne $body.ProcessBlock) { return $false }
+
+    # The shared purity oracle: non-allowlisted commands, index/member assignment, statement-level
+    # .NET method calls, and ++/-- are all already rejected by this one call.
+    if (Test-HasImpureCommand $body) { return $false }
+
+    # Parameter default values and attribute arguments (e.g. `$x = (Get-Date)`,
+    # `[ValidateScript({ Get-Content … })]`) execute at call time. A ParameterAst is an Ast, so the
+    # same oracle reaches both.
+    foreach ($p in @($fnAst.Parameters)) {
+        if ($null -ne $p -and (Test-HasImpureCommand $p)) { return $false }
+    }
+
+    # throw / exit / trap escape the function and change the CALLER's control flow or error state.
+    if (($body.FindAll({
+            param($x) $x -is [System.Management.Automation.Language.ThrowStatementAst] -or
+                      $x -is [System.Management.Automation.Language.ExitStatementAst] -or
+                      $x -is [System.Management.Automation.Language.TrapStatementAst] }, $true)).Count -gt 0) {
+        return $false
+    }
+
+    # break / continue are only harmless when BOUND to a loop or switch inside this same body. An
+    # unbound one propagates out of the function into the caller's loop (real PowerShell semantics),
+    # so it is a genuine external effect. Walk up to — but never past — the body; a labeled jump can
+    # target an outer construct and is always rejected; a ScriptBlockExpressionAst boundary means a
+    # deferred delegate whose invocation context is unknown, so stop and reject there too.
+    foreach ($j in $body.FindAll({
+            param($x) $x -is [System.Management.Automation.Language.BreakStatementAst] -or
+                      $x -is [System.Management.Automation.Language.ContinueStatementAst] }, $true)) {
+        if ($null -ne $j.Label) { return $false }
+        $p = $j.Parent; $bound = $false
+        while ($null -ne $p -and $p -ne $body) {
+            if ($p -is [System.Management.Automation.Language.LoopStatementAst] -or
+                $p -is [System.Management.Automation.Language.SwitchStatementAst]) { $bound = $true; break }
+            if ($p -is [System.Management.Automation.Language.ScriptBlockExpressionAst]) { break }
+            $p = $p.Parent
+        }
+        if (-not $bound) { return $false }
+    }
+
+    # A scoped write outlives the call (same rule as Test-EffectFreeBlock). A plain `$x = …` is
+    # function-local in PowerShell — it shadows rather than mutates an outer name — so it is fine.
+    foreach ($a in $body.FindAll({
+            param($x) $x -is [System.Management.Automation.Language.AssignmentStatementAst] }, $true)) {
+        if ($a.Left -is [System.Management.Automation.Language.VariableExpressionAst]) {
+            if ((Get-VarName $a.Left) -match '^(global|script|env|using):') { return $false }
+        }
+    }
+
+    return $true
+}
+
+# Is a PipelineAst's parent a "real" statement position — normal sequential script flow (root script,
+# or any function body at any nesting depth) as opposed to the body of a scriptblock *literal* passed
+# as a value/callback (e.g. `ForEach-Object { ... }`, `$sb = { ... }`)? Both shapes use NamedBlockAst
+# for their direct statement list, distinguished only by what the enclosing ScriptBlockAst's own
+# .Parent is: $null (true root) or FunctionDefinitionAst (a function body) for real flow, vs
+# ScriptBlockExpressionAst for a scriptblock literal used as a deferred delegate — deleting a
+# "looks pure" statement out of a delegate body that may be invoked later in an unknown context is a
+# different, riskier judgment than deleting one sitting in normal script flow, so that case stays
+# excluded exactly as it was before this function existed.
+function Test-RealStatementPosition($pipelineParent) {
+    if ($pipelineParent -is [System.Management.Automation.Language.StatementBlockAst]) {
+        # Array-literal elements (`1,2,3` in `@(1,2,3)`) also sit inside a StatementBlockAst, but that
+        # block's own .Parent is the ArrayExpressionAst — that's data, not an executed statement
+        # (mirrors the same exclusion already applied in Test-EffectFreeBlock above).
+        return $pipelineParent.Parent -isnot [System.Management.Automation.Language.ArrayExpressionAst]
+    }
+    if ($pipelineParent -is [System.Management.Automation.Language.NamedBlockAst]) {
+        $sb = $pipelineParent.Parent
+        if ($sb -is [System.Management.Automation.Language.ScriptBlockAst]) {
+            return ($null -eq $sb.Parent) -or ($sb.Parent -is [System.Management.Automation.Language.FunctionDefinitionAst])
+        }
+    }
+    return $false
 }
 
 function Get-CondExpr($condAst) {
@@ -348,6 +605,22 @@ function Resolve-ConstImpl($exprAst, [bool]$hasStrictMode, $reservedVars, $assig
         return @{ Known = $true; Value = $result }
     }
 
+    # Scalar string char-index: ("abc")[1] -> 'b'. Only the SINGLE-index case belongs in
+    # this scalar resolver — an array index (("abc")[0,2]) yields a collection and is
+    # handled by Get-AllStringElements, never here. Constant string target indexed by one
+    # resolvable integer; PowerShell negative indexing applies; out of range -> $unknown.
+    if ($exprAst -is [System.Management.Automation.Language.IndexExpressionAst]) {
+        if ($exprAst.Index -is [System.Management.Automation.Language.ArrayLiteralAst]) { return $unknown }
+        $tgt = Resolve-Const $exprAst.Target $hasStrictMode $reservedVars $assignedVars $ConstVars $Cache
+        if (-not $tgt.Known -or $tgt.Value -isnot [string]) { return $unknown }
+        $ir = Resolve-Const $exprAst.Index $hasStrictMode $reservedVars $assignedVars $ConstVars $Cache
+        if (-not $ir.Known -or ($ir.Value -isnot [int] -and $ir.Value -isnot [long])) { return $unknown }
+        $s = [string]$tgt.Value; $i = [int]$ir.Value
+        if ($i -lt 0) { $i += $s.Length }
+        if ($i -lt 0 -or $i -ge $s.Length) { return $unknown }
+        return @{ Known = $true; Value = $s[$i] }
+    }
+
     return $unknown
 }
 
@@ -377,11 +650,6 @@ function Test-ContainedByRemoved([int]$s, [int]$e, $removed) {
     return $false
 }
 
-function Test-InPureConstruct([int]$off, $pureConstructRanges) {
-    foreach ($r in $pureConstructRanges) { if ($off -ge $r.Start -and $off -lt $r.End) { return $true } }
-    return $false
-}
-
 # Fast O(1)/O(log N) variants — rebuild index once per fixpoint iteration.
 function Build-RemovedIndex($removed) {
     $exact  = [System.Collections.Generic.HashSet[string]]::new()
@@ -406,26 +674,6 @@ function Test-InRemovedFast([int]$off, $idx) {
     foreach ($r in $idx.Sorted) {
         if ($r.Start -gt $off) { break }
         if ($off -ge $r.Start -and $off -lt $r.End) { return $true }
-    }
-    return $false
-}
-
-function Test-InPureConstructFast([int]$off, $pureIdx) {
-    foreach ($r in $pureIdx) {
-        if ($r.Start -gt $off) { break }
-        if ($off -ge $r.Start -and $off -lt $r.End) { return $true }
-    }
-    return $false
-}
-
-function Test-LiveRead([string]$name, [int]$lo, [int]$hi, $readsByName, $idx, $pureIdx) {
-    $nameReads = $null
-    if (-not $readsByName.TryGetValue($name, [ref]$nameReads)) { return $false }
-    foreach ($rd in $nameReads) {
-        if ($rd.Start -ge $lo -and $rd.Start -lt $hi) { continue }
-        if (Test-InRemovedFast $rd.Start $idx) { continue }
-        if (Test-InPureConstructFast $rd.Start $pureIdx) { continue }
-        return $true
     }
     return $false
 }
@@ -621,10 +869,11 @@ function Invoke-PsCollapseBlankLines([string]$InputPath, [string]$OutputPath) {
 # Pass 3: Dead-code removal (AST-based liveness analysis, fixpoint loop)
 # ---------------------------------------------------------------------------
 
-function Invoke-PsRemoveDeadCode([string]$InputPath, [string]$OutputPath, [bool]$PreserveStringLiterals = $true) {
+function Invoke-PsRemoveDeadCode([string]$InputPath, [string]$OutputPath, [bool]$PreserveStringLiterals = $true, [bool]$Aggressive = $false) {
     $raw    = [System.IO.File]::ReadAllText($InputPath)
     $tokens = $null; $errors = $null
     $ast    = [System.Management.Automation.Language.Parser]::ParseInput($raw, [ref]$tokens, [ref]$errors)
+
 
     # Build per-AST context (never reused across function calls)
     $hasStrictMode = ($ast.FindAll({ param($n)
@@ -678,9 +927,41 @@ function Invoke-PsRemoveDeadCode([string]$InputPath, [string]$OutputPath, [bool]
         if (-not $readsByName.ContainsKey($nm)) { $readsByName[$nm] = [System.Collections.Generic.List[pscustomobject]]::new() }
         $readsByName[$nm].Add([pscustomobject]@{ Start = $v.Extent.StartOffset })
     }
+    # A variable reached by *string* name via the *-Variable cmdlet family
+    # (`Get-Variable counter`, `Set-Variable -Name counter …`) is invisible to the
+    # VariableExpressionAst scan above — the name is a StringConstantExpressionAst, not a `$var` read —
+    # so its writers (a store, or a `while(){ $counter++ }`) would look dead and be removed by ANY pass,
+    # silently breaking the dynamic access. Register a synthetic always-live read at sentinel offset -1
+    # for each such name: -1 is below every real StartOffset and never inside a candidate's [Start,End)
+    # range, so it is never Covered and permanently marks the name live everywhere (work-queue liveness
+    # and the aggressive cluster's self-containment alike). Conservative and safe (only ever keeps more).
+    # Interpolation `"$x"`, splat `@x`, and `[ref]$x` already surface as real reads, so are not needed
+    # here. Fully dynamic names (Invoke-Expression / $ExecutionContext.SessionState.PSVariable) remain
+    # undecidable — inherent to static analysis, unchanged from the base tool.
+    $varRefCmdlets = [System.Collections.Generic.HashSet[string]]([System.StringComparer]::OrdinalIgnoreCase)
+    @('Get-Variable','Set-Variable','Clear-Variable','Remove-Variable','New-Variable',
+      'gv','sv','rv','nv','spv') | ForEach-Object { [void]$varRefCmdlets.Add($_) }
+    foreach ($cmd in $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.CommandAst] }, $true)) {
+        $cn = $cmd.GetCommandName()
+        if ($null -eq $cn -or -not $varRefCmdlets.Contains($cn)) { continue }
+        for ($ei = 1; $ei -lt $cmd.CommandElements.Count; $ei++) {   # skip element 0 (the command name)
+            $el = $cmd.CommandElements[$ei]
+            if ($el -is [System.Management.Automation.Language.StringConstantExpressionAst]) {
+                $dn = $el.Value.ToLowerInvariant()
+                if (-not $readsByName.ContainsKey($dn)) { $readsByName[$dn] = [System.Collections.Generic.List[pscustomobject]]::new() }
+                $readsByName[$dn].Add([pscustomobject]@{ Start = -1 })
+            }
+        }
+    }
 
     $assignments = foreach ($a in $assignNodes) {
-        if ($a.Operator -ne 'Equals') { continue }
+        # Equals stores are candidates in every mode. Compound assignments (`$v += …`, `-=`, …) join
+        # only under -Aggressive: they REBIND the name to a fresh value (never mutate a shared object),
+        # so an accumulate-into-a-dead-variable chain is safely removable, but they are also a read of
+        # the target, so the default (conservative) mode leaves them exactly as before.
+        $isEquals   = ($a.Operator.ToString() -eq 'Equals')
+        $isCompound = ($a.Operator.ToString() -in @('PlusEquals','MinusEquals','MultiplyEquals','DivideEquals','RemainderEquals'))
+        if (-not $isEquals -and -not ($Aggressive -and $isCompound)) { continue }
         if (-not ($a.Left -is [System.Management.Automation.Language.VariableExpressionAst])) { continue }
         $name = Get-VarName $a.Left
         if ($name -match ':') { continue }
@@ -690,24 +971,27 @@ function Invoke-PsRemoveDeadCode([string]$InputPath, [string]$OutputPath, [bool]
         # Skip them here — they're removed only when the entire loop is removed.
         if ($a.Parent -is [System.Management.Automation.Language.ForStatementAst]) { continue }
 
-        # AssignmentStatementAst.Right arrives as a PipelineAst (PS7) or directly as a
-        # CommandExpressionAst (Windows PowerShell 5.1) — unwrap both, else PreserveStringLiterals
-        # silently never fires on 5.1 (mirrors the unwrap in Invoke-PsInlineConstants).
-        $rhsPayloadExpr = $null
-        if ($a.Right -is [System.Management.Automation.Language.PipelineAst]) {
-            if ($a.Right.PipelineElements.Count -eq 1 -and
-                $a.Right.PipelineElements[0] -is [System.Management.Automation.Language.CommandExpressionAst]) {
-                $rhsPayloadExpr = $a.Right.PipelineElements[0].Expression
+        # PreserveStringLiterals payload detection is Equals-only (a compound op's value is not a bare
+        # literal). AssignmentStatementAst.Right arrives as a PipelineAst (PS7) or directly as a
+        # CommandExpressionAst (Windows PowerShell 5.1) — unwrap both (mirrors Invoke-PsInlineConstants).
+        $isPayloadString = $false
+        if ($isEquals) {
+            $rhsPayloadExpr = $null
+            if ($a.Right -is [System.Management.Automation.Language.PipelineAst]) {
+                if ($a.Right.PipelineElements.Count -eq 1 -and
+                    $a.Right.PipelineElements[0] -is [System.Management.Automation.Language.CommandExpressionAst]) {
+                    $rhsPayloadExpr = $a.Right.PipelineElements[0].Expression
+                }
+            } elseif ($a.Right -is [System.Management.Automation.Language.CommandExpressionAst]) {
+                $rhsPayloadExpr = $a.Right.Expression
             }
-        } elseif ($a.Right -is [System.Management.Automation.Language.CommandExpressionAst]) {
-            $rhsPayloadExpr = $a.Right.Expression
+            $isPayloadString = (
+                $PreserveStringLiterals -and
+                $null -ne $rhsPayloadExpr -and
+                $rhsPayloadExpr -is [System.Management.Automation.Language.ConstantExpressionAst] -and
+                $rhsPayloadExpr.Value -is [string]
+            )
         }
-        $isPayloadString = (
-            $PreserveStringLiterals -and
-            $null -ne $rhsPayloadExpr -and
-            $rhsPayloadExpr -is [System.Management.Automation.Language.ConstantExpressionAst] -and
-            $rhsPayloadExpr.Value -is [string]
-        )
 
         [pscustomobject]@{
             Start            = $a.Extent.StartOffset
@@ -720,7 +1004,8 @@ function Invoke-PsRemoveDeadCode([string]$InputPath, [string]$OutputPath, [bool]
 
     $loops = foreach ($l in $ast.FindAll({ param($n)
             ($n -is [System.Management.Automation.Language.WhileStatementAst]) -or
-            ($n -is [System.Management.Automation.Language.ForStatementAst]) }, $true)) {
+            ($n -is [System.Management.Automation.Language.ForStatementAst]) -or
+            ($n -is [System.Management.Automation.Language.ForEachStatementAst]) }, $true)) {
         $vars = @()
         foreach ($ia in $l.FindAll({ param($n) $n -is [System.Management.Automation.Language.AssignmentStatementAst] }, $true)) {
             if ($ia.Left -is [System.Management.Automation.Language.VariableExpressionAst]) { $vars += (Get-VarName $ia.Left) }
@@ -728,15 +1013,36 @@ function Invoke-PsRemoveDeadCode([string]$InputPath, [string]$OutputPath, [bool]
         foreach ($u in $l.FindAll({ param($n) $n -is [System.Management.Automation.Language.UnaryExpressionAst] }, $true)) {
             if ($u.Child -is [System.Management.Automation.Language.VariableExpressionAst]) { $vars += (Get-VarName $u.Child) }
         }
+        $isForEach = $l -is [System.Management.Automation.Language.ForEachStatementAst]
+        # The per-iteration loop variable is an implicit assignment on every pass. PowerShell doesn't
+        # scope it away after the loop, so if it leaks and is read afterward, the loop must count as
+        # live rather than dead — include it in AssignedVars for that liveness check.
+        if ($isForEach -and $l.Variable -is [System.Management.Automation.Language.VariableExpressionAst]) {
+            $vars += (Get-VarName $l.Variable)
+        }
         $condExpr  = Get-CondExpr $l.Condition
         $condFalsy = ($null -ne $condExpr -and (Test-FalsyConst $condExpr $hasStrictMode $reservedVars $assignedVars))
+        # Owned bookkeeping names: the loop's own local writes (iterator/accumulator). An increment of
+        # one of these is not an external side effect — pass them to Test-HasImpureCommand so its own
+        # `$i++`/`$counter++` no longer disqualifies the whole loop, while real impure commands and
+        # increments of scoped/global names still do. Scoped names (`global:`/`script:`/`env:`/`using:`)
+        # carry `:` in the UserPath and are excluded so their increments remain flagged as impure.
+        $ownedInc = [System.Collections.Generic.HashSet[string]]([System.StringComparer]::OrdinalIgnoreCase)
+        foreach ($vn in $vars) { if ($vn -ne 'null' -and $vn -notmatch ':') { [void]$ownedInc.Add($vn) } }
         [pscustomobject]@{
             Start            = $l.Extent.StartOffset
             End              = $l.Extent.EndOffset
-            AssignedVars     = @($vars | Select-Object -Unique)
-            HasImpureCommand = (Test-HasImpureCommand $l)
+            # $null is PowerShell's reserved discard variable: assignment to it is documented,
+            # always-a-no-op syntax, so a read of $null elsewhere in the script can never reflect one
+            # of these internal writes (there is no data flow for this one name). Tracking it as an
+            # ordinary AssignedVars entry creates a false liveness dependency on any unrelated $null
+            # read anywhere in the file — exclude it so this construct's removability depends only on
+            # names that can actually carry data.
+            AssignedVars     = @($vars | Where-Object { $_ -ne 'null' } | Select-Object -Unique)
+            HasImpureCommand = (Test-HasImpureCommand $l $ownedInc)
             CondIsFalsy      = $condFalsy
             IsValueConsumed  = (Test-ValueConsumed $l)
+            IsForEach        = $isForEach
         }
     }
 
@@ -748,7 +1054,13 @@ function Invoke-PsRemoveDeadCode([string]$InputPath, [string]$OutputPath, [bool]
         [pscustomobject]@{
             Start            = $t.Extent.StartOffset
             End              = $t.Extent.EndOffset
-            AssignedVars     = @($vars | Select-Object -Unique)
+            # $null is PowerShell's reserved discard variable: assignment to it is documented,
+            # always-a-no-op syntax, so a read of $null elsewhere in the script can never reflect one
+            # of these internal writes (there is no data flow for this one name). Tracking it as an
+            # ordinary AssignedVars entry creates a false liveness dependency on any unrelated $null
+            # read anywhere in the file — exclude it so this construct's removability depends only on
+            # names that can actually carry data.
+            AssignedVars     = @($vars | Where-Object { $_ -ne 'null' } | Select-Object -Unique)
             HasImpureCommand = (Test-HasImpureCommand $t.Body) -or
                                ($null -ne $t.Finally -and (Test-HasImpureCommand $t.Finally))
             IsValueConsumed  = (Test-ValueConsumed $t)
@@ -768,7 +1080,9 @@ function Invoke-PsRemoveDeadCode([string]$InputPath, [string]$OutputPath, [bool]
             foreach ($ia in $blockAst.FindAll({ param($n) $n -is [System.Management.Automation.Language.AssignmentStatementAst] }, $true)) {
                 if ($ia.Left -is [System.Management.Automation.Language.VariableExpressionAst]) {
                     $vn = Get-VarName $ia.Left
-                    if ($vn -notmatch '^(global|script|env|using):') { $vn }
+                    # $null is a reserved discard variable — see the AssignedVars comment above;
+                    # a store to it can never create a real dependency on an unrelated $null read.
+                    if ($vn -notmatch '^(global|script|env|using):' -and $vn -ne 'null') { $vn }
                 }
             }
         }
@@ -796,25 +1110,148 @@ function Invoke-PsRemoveDeadCode([string]$InputPath, [string]$OutputPath, [bool]
         Where-Object { -not $invokedNames.Contains($_.Name) } |
         ForEach-Object { [pscustomobject]@{ Start=$_.Extent.StartOffset; End=$_.Extent.EndOffset } })
 
-    # Standalone pure pipeline statements (e.g. Get-Random | Out-Null) — result discarded, no side effects.
-    # Restrict to root-script-level statements only: grandparent ScriptBlockAst must have no parent
-    # (nested scriptblocks like ForEach-Object { [char]$_ } share the NamedBlockAst type but their
-    # ScriptBlockAst.Parent is a ScriptBlockExpressionAst, not null).
+    # Aggressive-only: functions that ARE invoked but whose body is provably effect-free, where every
+    # call site is itself a result-discarded statement (never assigned, piped, redirected, or captured
+    # by $(...)/@(...)) — at ANY nesting depth (a try/if/loop/function body), not just the script root;
+    # a no-op helper is just as often called from inside a nested block as from the top level. Safe
+    # because a value-consumed call would make the "no observable effect" premise false for that call
+    # site, so any single value-consuming call disqualifies the function entirely rather than only
+    # that call.
+    #
+    # Keyed by NAME, not by definition: a name may be defined more than once (obfuscators reuse a small
+    # pool of names heavily), and removing the call sites of a name is a decision about the name — the
+    # call sites cannot be attributed to one particular definition. So every definition sharing the name
+    # must qualify before any of them, or any call to it, is removed.
+    $noopFnNodes = @()
+    if ($Aggressive) {
+        # One lowercased blob of every quoted string literal in the script. A function name occurring
+        # inside one may be dispatched dynamically (`& "f"`, `iex "f 2"`) — invisible to the CommandAst
+        # call-site scan below — so such a name is skipped entirely. BareWord constants are excluded:
+        # those ARE the ordinary command-name/argument tokens (the call sites themselves), not data.
+        $litBlob = (($ast.FindAll({
+                param($n)
+                $n -is [System.Management.Automation.Language.StringConstantExpressionAst] -and
+                $n.StringConstantType -ne [System.Management.Automation.Language.StringConstantType]::BareWord
+            }, $true) | ForEach-Object { $_.Value }) -join "`n").ToLowerInvariant()
+
+        $allCommandAsts = @($ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.CommandAst] }, $true))
+        $fnDefs = @($ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true))
+
+        foreach ($grp in ($fnDefs | Group-Object -Property Name)) {
+            $fnName = $grp.Name
+            if (-not $invokedNames.Contains($fnName)) { continue }
+            if ($litBlob.Contains($fnName.ToLowerInvariant())) { continue }   # possible dynamic dispatch
+
+            $allFree = $true
+            foreach ($def in $grp.Group) {
+                if (-not (Test-EffectFreeFunctionBody $def)) { $allFree = $false; break }
+            }
+            if (-not $allFree) { continue }
+
+            $callSites = @($allCommandAsts | Where-Object { $_.GetCommandName() -eq $fnName })
+            if ($callSites.Count -eq 0) { continue }
+
+            $allDiscarded = $true
+            foreach ($call in $callSites) {
+                $pipe = $call.Parent
+                if (-not ($pipe -is [System.Management.Automation.Language.PipelineAst] -and
+                          $pipe.PipelineElements.Count -eq 1)) { $allDiscarded = $false; break }
+                # `f > out.txt` writes a file — the discarded value is not actually discarded.
+                if ($call.Redirections.Count -gt 0) { $allDiscarded = $false; break }
+                # Real sequential statement position only — never a scriptblock literal's body
+                # (a deferred delegate) nor an @(...) element slot.
+                if (-not (Test-RealStatementPosition $pipe.Parent)) { $allDiscarded = $false; break }
+                # A $(...)/@(...)/assignment ancestor means the value IS consumed. The statement-position
+                # test alone does not catch this: a SubExpressionAst's statements also live in a
+                # StatementBlockAst, so `$a = $(f)` looks like a bare statement without this check.
+                if (Test-ValueConsumed $call) { $allDiscarded = $false; break }
+                # The ARGUMENTS still execute — deleting the call deletes them too, so a side effect
+                # nested in one (e.g. `f (Get-Content x)`) must keep the whole call. Element 0 is the
+                # command name itself.
+                for ($ei = 1; $ei -lt $call.CommandElements.Count; $ei++) {
+                    if (Test-HasImpureCommand $call.CommandElements[$ei]) { $allDiscarded = $false; break }
+                }
+                if (-not $allDiscarded) { break }
+            }
+            if (-not $allDiscarded) { continue }
+
+            foreach ($def in $grp.Group) {
+                $noopFnNodes += [pscustomobject]@{ Start=$def.Extent.StartOffset; End=$def.Extent.EndOffset }
+            }
+            foreach ($call in $callSites) {
+                $noopFnNodes += [pscustomobject]@{ Start=$call.Parent.Extent.StartOffset; End=$call.Parent.Extent.EndOffset }
+            }
+        }
+    }
+
+    # Standalone pure pipeline statements (e.g. Get-Random | Out-Null) — result discarded, no side
+    # effects. Accepted at any real statement position (root script or any function body, any nesting
+    # depth) via Test-RealStatementPosition — but not inside a scriptblock *literal* passed as a value
+    # (e.g. ForEach-Object { [char]$_ }), which stays excluded exactly as before. Also excluded: a
+    # statement whose value is actually consumed by an enclosing value-context (e.g. the last
+    # expression inside a captured `$x = foreach(...){ $i * 2 }` loop) — broadening past root-level
+    # made this reachable, since such a loop body's statement now structurally qualifies as a "real
+    # statement position" too, but it is not discarded at all; removing it would silently change $x.
     $pureStmtNodes = @($ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.PipelineAst] }, $true) |
         Where-Object {
-            $_.Parent -is [System.Management.Automation.Language.NamedBlockAst] -and
-            $null -eq $_.Parent.Parent.Parent -and
+            (Test-RealStatementPosition $_.Parent) -and
+            -not (Test-ValueConsumed $_) -and
             -not (Test-HasImpureCommand $_)
         } |
         ForEach-Object { [pscustomobject]@{ Start=$_.Extent.StartOffset; End=$_.Extent.EndOffset } })
 
-    $pureConstructRanges = @(
-        @($loops     | Where-Object { -not $_.HasImpureCommand -and -not $_.IsValueConsumed })
-        @($tryBlocks | Where-Object { -not $_.HasImpureCommand -and -not $_.IsValueConsumed })
-    ) | ForEach-Object { $_ } | Where-Object { $_ } |
-        ForEach-Object { [pscustomobject]@{ Start=$_.Start; End=$_.End } }
-
-    $pureIdx = @($pureConstructRanges | Sort-Object Start)
+    # Aggressive-only: bare receiver-only mutator statements (`$v.Clear()`, `$v.Add(...)`) treated as
+    # removable "writers" of $v, so an accumulate-then-discard junk trio
+    # (`$v = @(); $v += "x"; $v.Clear()`) clusters and is deleted whole. Each is admitted only when it
+    # cannot possibly be observed elsewhere — the guards below are all necessary for soundness:
+    #   * receiver is a plain local variable (no chain/static/scoped/reserved name),
+    #   * method is on the receiver-ONLY mutator allowlist (args are never written back through),
+    #   * arguments are side-effect-free (no command, no non-pure .NET method, no ++/--, no scriptblock
+    #     that a mutator like .Sort could invoke),
+    #   * the statement is a bare, result-discarded statement in real script flow (not value-consumed,
+    #     not a scriptblock-literal body),
+    #   * the receiver is fresh-confined (every `=` to it binds a fresh object — closes aliasing-IN;
+    #     the cluster/work-queue escape check closes aliasing-OUT).
+    # A method call is otherwise NEVER assumed pure (Test-HasImpureCommand still flags all of them),
+    # so this is strictly additive and gated behind -Aggressive.
+    $mutatorNodes = @()
+    if ($Aggressive) {
+        foreach ($inv in $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.InvokeMemberExpressionAst] }, $true)) {
+            if ($inv.Static) { continue }
+            $mnode = $inv.Member
+            if ($mnode -isnot [System.Management.Automation.Language.StringConstantExpressionAst]) { continue }
+            if (-not $script:PsReceiverOnlyMutators.Contains($mnode.Value)) { continue }
+            $recv = $inv.Expression
+            if ($recv -isnot [System.Management.Automation.Language.VariableExpressionAst]) { continue }
+            $rname = Get-VarName $recv
+            if ($rname -match ':' -or $reservedVars.Contains($rname)) { continue }
+            # Bare, result-discarded statement in real script flow.
+            $ce = $inv.Parent
+            if ($ce -isnot [System.Management.Automation.Language.CommandExpressionAst]) { continue }
+            $pipe = $ce.Parent
+            if ($pipe -isnot [System.Management.Automation.Language.PipelineAst]) { continue }
+            if (-not (Test-RealStatementPosition $pipe.Parent)) { continue }
+            if (Test-ValueConsumed $inv) { continue }
+            # Side-effect-free arguments.
+            $argsOk = $true
+            foreach ($arg in $inv.Arguments) {
+                if (($arg.FindAll({ param($n) $n -is [System.Management.Automation.Language.CommandAst] }, $true)).Count -gt 0) { $argsOk=$false; break }
+                if (($arg.FindAll({ param($n) $n -is [System.Management.Automation.Language.ScriptBlockExpressionAst] }, $true)).Count -gt 0) { $argsOk=$false; break }
+                foreach ($m in $arg.FindAll({ param($n) $n -is [System.Management.Automation.Language.InvokeMemberExpressionAst] }, $true)) {
+                    if (-not (Test-PureNetMethodInvoke $m)) { $argsOk=$false; break }
+                }
+                if (-not $argsOk) { break }
+                foreach ($u in $arg.FindAll({ param($n) $n -is [System.Management.Automation.Language.UnaryExpressionAst] }, $true)) {
+                    if ($u.TokenKind.ToString() -in @('PlusPlus','MinusMinus','PostfixPlusPlus','PostfixMinusMinus')) { $argsOk=$false; break }
+                }
+                if (-not $argsOk) { break }
+            }
+            if (-not $argsOk) { continue }
+            # Fresh-confined receiver — the guard that makes the in-place mutation unobservable.
+            if (-not (Test-FreshConfinedVar $rname $assignNodes)) { continue }
+            $mutatorNodes += [pscustomobject]@{ Start=$pipe.Extent.StartOffset; End=$pipe.Extent.EndOffset; Target=$rname }
+        }
+    }
 
     # -----------------------------------------------------------------------
     # Unified work-queue: O(N + E) replacement for the O(K*N) fixpoint loop
@@ -834,15 +1271,23 @@ function Invoke-PsRemoveDeadCode([string]$InputPath, [string]$OutputPath, [bool]
     foreach ($nm in $readsByName.Keys) { foreach ($rd in $readsByName[$nm]) { $allReadsL.Add($rd) } }
     $allReads = @($allReadsL | Sort-Object Start)
 
-    # Mark reads inside pure constructs as pre-covered (mirrors old Test-InPureConstruct skip)
-    foreach ($rd in $allReads) {
-        if (Test-InPureConstructFast $rd.Start $pureIdx) { $rd.Covered = $true }
-    }
+    # NOTE: reads are only ever marked Covered once a construct is confirmed removed (see the
+    # static-seeding blocks below and the work-queue's dequeue-and-remove step) — never pre-emptively.
+    # An earlier version blanket-covered every read inside any "pure, not-value-consumed" loop/try
+    # before liveness was decided; if the loop survived (its own assigned vars were read elsewhere),
+    # reads of *other* variables inside it were still wrongly hidden, causing live stores the surviving
+    # loop still needed (e.g. an accumulator's `$data`/`$i`) to be deleted as "dead". Self-referential
+    # liveness (a loop reading its own assigned var inside itself) is independently handled by the
+    # self-range exclusion in the liveness check below, so nothing relied on the removed pre-cover.
 
     # Build liveness-dependent queue candidates with stable CID = index
     $qList = [System.Collections.Generic.List[pscustomobject]]::new()
     foreach ($l in $loops) {
         if ($l.CondIsFalsy -or $l.HasImpureCommand -or $l.IsValueConsumed) { continue }
+        # Foreach loops only join the purity-based "non-functional loop" removal under -Aggressive;
+        # by default a foreach is only ever removed via the CondIsFalsy (unreachable/never-assigned
+        # collection) path above, mirroring while/for's existing conservative default.
+        if ($l.IsForEach -and -not $Aggressive) { continue }
         $qList.Add([pscustomobject]@{ CID=$qList.Count; Start=$l.Start; End=$l.End; Reason='non-functional loop'; Vars=$l.AssignedVars })
     }
     foreach ($t in $tryBlocks) {
@@ -851,7 +1296,11 @@ function Invoke-PsRemoveDeadCode([string]$InputPath, [string]$OutputPath, [bool]
     }
     foreach ($a in $assignments) {
         if ($a.HasImpureCommand) { continue }
-        $qList.Add([pscustomobject]@{ CID=$qList.Count; Start=$a.Start; End=$a.End; Reason='dead store'; Vars=@($a.Target) })
+        # $null is a reserved discard variable — see the AssignedVars comment above; a $null = <pure
+        # expr> store can never be "read back" by design, so it's tracked with no dependency (always
+        # dead), rather than colliding with unrelated $null reads elsewhere in the script.
+        $depVars = if ($a.Target -eq 'null') { @() } else { @($a.Target) }
+        $qList.Add([pscustomobject]@{ CID=$qList.Count; Start=$a.Start; End=$a.End; Reason='dead store'; Vars=$depVars })
     }
     # Removable ifs whose only effect is assigning locals: gate on liveness of those locals rather
     # than removing unconditionally (an unconditionally-seeded if with a live store — e.g. a loop
@@ -859,6 +1308,11 @@ function Invoke-PsRemoveDeadCode([string]$InputPath, [string]$OutputPath, [bool]
     foreach ($i in $ifNodes) {
         if (-not $i.Removable -or $i.StoreVars.Count -eq 0) { continue }
         $qList.Add([pscustomobject]@{ CID=$qList.Count; Start=$i.Start; End=$i.End; Reason='dead if (stores unused)'; Vars=$i.StoreVars })
+    }
+    # Bare receiver-only mutator calls (aggressive) depend on liveness of the receiver, exactly like a
+    # dead store — they cluster with that variable's `=`/`+=` writers and are removed together.
+    foreach ($m in $mutatorNodes) {
+        $qList.Add([pscustomobject]@{ CID=$qList.Count; Start=$m.Start; End=$m.End; Reason='dead mutator call'; Vars=@($m.Target) })
     }
     $qArr = $qList.ToArray()
 
@@ -929,6 +1383,20 @@ function Invoke-PsRemoveDeadCode([string]$InputPath, [string]$OutputPath, [bool]
             }
         }
     }
+    foreach ($nf in $noopFnNodes) {
+        if ($removedSet.Add("$($nf.Start):$($nf.End)")) {
+            $removed.Add([pscustomobject]@{ Start=$nf.Start; End=$nf.End; Reason='no-op function' })
+            $rS=$nf.Start; $rE=$nf.End
+            $bsLo=0; $bsHi=$allReads.Length-1; $bsF=$allReads.Length
+            while ($bsLo -le $bsHi) { $bsM=[int](($bsLo+$bsHi)/2); if ($allReads[$bsM].Start -ge $rS) { $bsF=$bsM; $bsHi=$bsM-1 } else { $bsLo=$bsM+1 } }
+            for ($ri=$bsF; $ri -lt $allReads.Length -and $allReads[$ri].Start -lt $rE; $ri++) {
+                $rd=$allReads[$ri]; if ($rd.Covered) { continue }; $rd.Covered=$true
+                $deps2=$null; if ($depR2C.TryGetValue($rd.Start,[ref]$deps2)) {
+                    foreach ($di in $deps2) { if (-not $removedCIDs.Contains($di) -and $inQueue.Add($di)) { [void]$workQueue.Enqueue($di) } }
+                }
+            }
+        }
+    }
     foreach ($stmt in $pureStmtNodes) {
         if ($removedSet.Add("$($stmt.Start):$($stmt.End)")) {
             $removed.Add([pscustomobject]@{ Start=$stmt.Start; End=$stmt.End; Reason='pure statement' })
@@ -939,6 +1407,126 @@ function Invoke-PsRemoveDeadCode([string]$InputPath, [string]$OutputPath, [bool]
                 $rd=$allReads[$ri]; if ($rd.Covered) { continue }; $rd.Covered=$true
                 $deps2=$null; if ($depR2C.TryGetValue($rd.Start,[ref]$deps2)) {
                     foreach ($di in $deps2) { if (-not $removedCIDs.Contains($di) -and $inQueue.Add($di)) { [void]$workQueue.Enqueue($di) } }
+                }
+            }
+        }
+    }
+
+    # -----------------------------------------------------------------------
+    # Aggressive-only: whole-variable ("faint variable") cluster removal.
+    #
+    # The incremental work-queue removes a candidate only once ALL of its external reads are already
+    # Covered, and a read is Covered only when the construct enclosing it is removed. A group of pure
+    # constructs that only ever read/write each other's shared variables (e.g. six
+    # `while ($counter -lt N) { $counter++ }` loops, or ten `for ($j…) { $final += $j }` loops) forms a
+    # reference cycle that never bootstraps — nothing can be the first removal — so the whole dead
+    # cluster survives. This pass breaks that deadlock soundly by reasoning per variable instead of per
+    # construct: it removes an entire connected component of candidates at once, but ONLY when every
+    # variable the component touches is provably confined to the component.
+    #
+    # Runs AFTER the unconditional static seeds above so their coverage is already applied: a read that
+    # sits inside an already-removed construct (e.g. `$counter` inside an unreachable
+    # `while ($counter -lt 0){…}` loop) is skipped below rather than counted as an escape. Only
+    # unconditional removals have happened at this point (the liveness work-queue runs afterward), so no
+    # read is skipped speculatively.
+    #
+    # Soundness: a component is removed only if (a) every candidate in it is local-eligible (no scoped/
+    # reserved/dynamically-named var) and (b) every variable written anywhere in the component is
+    # "self-contained" — every not-yet-Covered read of it lies inside one of that variable's own writer
+    # candidates (all of which are, by construction, in the same component). Deleting the whole
+    # component then erases every surviving read AND write of those variables, so no remaining code can
+    # observe the change. Candidates are already pure (they passed the removal gates, and
+    # Test-HasImpureCommand now treats index/member assignment as impure, so no candidate hides an
+    # untracked aliased write). The one candidate type that DOES mutate an object in place — a bare
+    # receiver-only mutator call (`$v.Clear()`/`$v.Add(...)`, admitted above) — is safe for the same
+    # reason: it is only ever emitted for a fresh-confined receiver (Test-FreshConfinedVar rules out
+    # aliasing-in) whose every surviving read is inside the component (this pass rules out aliasing-out),
+    # so its object is reachable through that one name only and the in-place mutation is unobservable.
+    # A component pinned alive by one escaping variable (e.g. a lone `Write-Output $final`) keeps ALL
+    # its members.
+    if ($Aggressive -and $qArr.Length -gt 0) {
+        # NB: dynamically-named variables (`Get-Variable x`, `Set-Variable -Name x`) need no dedicated
+        # guard here — each already carries a synthetic always-live read (sentinel offset -1, injected
+        # where readsByName is built), so its self-containment check below finds an uncovered read
+        # outside every writer and keeps the component. That one mechanism protects the default work-
+        # queue and this cluster pass identically.
+        $nCand = $qArr.Length
+        # writersOf[var] = CIDs writing it; candOk[ci] = all of candidate ci's vars are local-eligible
+        # (non-scoped, non-reserved). Scoped/global writes escape name-based liveness, so never cluster them.
+        $writersOf = [System.Collections.Generic.Dictionary[string,System.Collections.Generic.List[int]]]::new([System.StringComparer]::OrdinalIgnoreCase)
+        $candOk    = New-Object bool[] $nCand
+        for ($ci = 0; $ci -lt $nCand; $ci++) {
+            $ok = $true
+            foreach ($v in $qArr[$ci].Vars) {
+                if ($v -match ':' -or $reservedVars.Contains($v)) { $ok = $false }
+                $lst = $null
+                if (-not $writersOf.TryGetValue($v, [ref]$lst)) { $lst = [System.Collections.Generic.List[int]]::new(); $writersOf[$v] = $lst }
+                $lst.Add($ci)
+            }
+            $candOk[$ci] = $ok
+        }
+
+        # self-contained: every not-yet-Covered read of the var falls inside one of its writer
+        # candidates' extents. Covered reads belong to already-removed static constructs — they will not
+        # exist in the output, so they can never observe the variable and must not count as escapes.
+        $selfC = [System.Collections.Generic.Dictionary[string,bool]]::new([System.StringComparer]::OrdinalIgnoreCase)
+        foreach ($v in $writersOf.Keys) {
+            $contained = $true
+            $vReads = $null
+            if ($readsByName.TryGetValue($v, [ref]$vReads)) {
+                foreach ($rd in $vReads) {
+                    if ($rd.Covered) { continue }
+                    $inside = $false
+                    foreach ($ci in $writersOf[$v]) {
+                        if ($rd.Start -ge $qArr[$ci].Start -and $rd.Start -lt $qArr[$ci].End) { $inside = $true; break }
+                    }
+                    if (-not $inside) { $contained = $false; break }
+                }
+            }
+            $selfC[$v] = $contained
+        }
+
+        # Union-Find: connect candidates that share a written variable (path-halving finds inline).
+        $parent = New-Object int[] $nCand
+        for ($ci = 0; $ci -lt $nCand; $ci++) { $parent[$ci] = $ci }
+        foreach ($v in $writersOf.Keys) {
+            $lst = $writersOf[$v]
+            for ($k = 1; $k -lt $lst.Count; $k++) {
+                $a = $lst[0]; $b = $lst[$k]
+                while ($parent[$a] -ne $a) { $parent[$a] = $parent[$parent[$a]]; $a = $parent[$a] }
+                while ($parent[$b] -ne $b) { $parent[$b] = $parent[$parent[$b]]; $b = $parent[$b] }
+                if ($a -ne $b) { $parent[$a] = $b }
+            }
+        }
+        # A component is removable unless any member is not local-eligible…
+        $compRemovable = [System.Collections.Generic.Dictionary[int,bool]]::new()
+        for ($ci = 0; $ci -lt $nCand; $ci++) {
+            $r = $ci; while ($parent[$r] -ne $r) { $parent[$r] = $parent[$parent[$r]]; $r = $parent[$r] }
+            if (-not $compRemovable.ContainsKey($r)) { $compRemovable[$r] = $true }
+            if (-not $candOk[$ci]) { $compRemovable[$r] = $false }
+        }
+        # …or any variable it touches escapes (has a surviving read outside all its writers).
+        foreach ($v in $writersOf.Keys) {
+            if ($selfC[$v]) { continue }
+            foreach ($ci in $writersOf[$v]) {
+                $r = $ci; while ($parent[$r] -ne $r) { $parent[$r] = $parent[$parent[$r]]; $r = $parent[$r] }
+                $compRemovable[$r] = $false
+            }
+        }
+        # Seed removals for members of removable components; cover their reads (no propagation needed —
+        # every candidate is enqueued for a final liveness check below, now seeing these reads Covered).
+        for ($ci = 0; $ci -lt $nCand; $ci++) {
+            $r = $ci; while ($parent[$r] -ne $r) { $parent[$r] = $parent[$parent[$r]]; $r = $parent[$r] }
+            if (-not $compRemovable[$r]) { continue }
+            $c = $qArr[$ci]
+            [void]$removedCIDs.Add($ci)
+            if ($removedSet.Add("$($c.Start):$($c.End)")) {
+                $removed.Add([pscustomobject]@{ Start=$c.Start; End=$c.End; Reason='dead variable cluster' })
+                $rS=$c.Start; $rE=$c.End
+                $bsLo=0; $bsHi=$allReads.Length-1; $bsF=$allReads.Length
+                while ($bsLo -le $bsHi) { $bsM=[int](($bsLo+$bsHi)/2); if ($allReads[$bsM].Start -ge $rS) { $bsF=$bsM; $bsHi=$bsM-1 } else { $bsLo=$bsM+1 } }
+                for ($ri=$bsF; $ri -lt $allReads.Length -and $allReads[$ri].Start -lt $rE; $ri++) {
+                    $rd=$allReads[$ri]; if ($rd.Covered) { continue }; $rd.Covered=$true
                 }
             }
         }
@@ -994,6 +1582,7 @@ function Invoke-PsRemoveDeadCode([string]$InputPath, [string]$OutputPath, [bool]
     return @{
         changed      = $removed.Count
         by_reason    = $byReason
+        aggressive   = $Aggressive
         input_bytes  = $raw.Length
         output_bytes = $out.Length
         output_path  = $OutputPath
@@ -2207,6 +2796,129 @@ function Invoke-PsStripLines {
 }
 
 # ---------------------------------------------------------------------------
+# Invoke-PsStripComments — Remove comment-only lines (token-driven)
+# ---------------------------------------------------------------------------
+
+# Comments whose text carries meaning beyond documentation and must survive every strip:
+#   * `#requires -Version 5` — a real directive PowerShell acts on at load time. Deleting it
+#     changes how the script runs, so it is never optional.
+#   * `#!` shebang — interpreter hint for the *nix launcher.
+#   * PsAnnotate-Iex output (`# <<<IEX PAYLOAD BEGIN>>>`, `# > <payload line>`, …, emitted by
+#     Invoke-PsAnnotateIex above) — that pass exists to recover payloads INTO comments, so stripping
+#     them would throw away the analysis result of a sibling tool.
+$script:PsProtectedCommentPatterns = @(
+    '(?i)^#requires\b'
+    '^#!'
+    '^#\s*(>|<<<(IEX PAYLOAD|ENCODED COMMAND) (BEGIN|END)>>>)'
+)
+
+# Removes comments the parser identified, working from the TOKEN STREAM rather than a line regex.
+# That distinction is the whole point of this pass: a `#` inside a here-string or a multi-line
+# string is never a Comment token, so string data can not be corrupted the way a `^\s*#` line filter
+# (Invoke-PsStripLines) corrupts it. Block comments `<# … #>` are handled for free — the token
+# extent already spans every line of the block.
+#
+# Default scope is a comment that OWNS its line (only whitespace before it): the line, its indent
+# and its newline all go. A comment sitting after real code is left alone unless -IncludeTrailing,
+# and even then only when it runs to end of line — an inline `Write-Host<#x#>hi` is skipped outright
+# because deleting it would fuse two adjacent tokens into one. Unrecognized shape -> keep, the same
+# convention every other pass in this library follows (a missed cleanup, never a corruption).
+#
+# Edits are offset-based over the raw text, so line endings (this toolkit routinely sees mixed
+# CRLF/LF samples) and the final-newline state survive byte-for-byte outside the deleted ranges.
+function Invoke-PsStripComments {
+    param(
+        [string]$InputPath,
+        [string]$OutputPath,
+        [bool]$IncludeTrailing = $false,
+        [string]$KeepPattern = $null
+    )
+    $raw      = [System.IO.File]::ReadAllText($InputPath)
+    $inputLen = $raw.Length
+    $tokens   = $null; $errors = $null
+    # Parse-only — the target script is never executed. Parse errors are not fatal: a partially
+    # parsed sample still yields usable comment tokens, and every other pass tolerates them too.
+    [void][System.Management.Automation.Language.Parser]::ParseInput($raw, [ref]$tokens, [ref]$errors)
+
+    $comments = @($tokens | Where-Object { $_.Kind -eq [System.Management.Automation.Language.TokenKind]::Comment })
+
+    $ranges          = [System.Collections.Generic.List[pscustomobject]]::new()
+    $lineRemoved     = 0
+    $trailingRemoved = 0
+    $kept            = 0
+
+    foreach ($c in $comments) {
+        $text = $c.Extent.Text
+
+        $protect = $false
+        foreach ($p in $script:PsProtectedCommentPatterns) {
+            if ($text -match $p) { $protect = $true; break }
+        }
+        if (-not $protect -and $KeepPattern -and $text -match $KeepPattern) { $protect = $true }
+        if ($protect) { $kept++; continue }
+
+        $s = $c.Extent.StartOffset
+        $e = $c.Extent.EndOffset
+
+        # Walk left over the indent. Line-leading means nothing but whitespace precedes it on
+        # its line (or it is the very start of the file).
+        $ls = $s
+        while ($ls -gt 0 -and ($raw[$ls - 1] -eq ' ' -or $raw[$ls - 1] -eq "`t")) { $ls-- }
+        $lineLeading = ($ls -eq 0) -or ($raw[$ls - 1] -eq "`n")
+
+        # Walk right over trailing whitespace, then the line terminator if one is there.
+        $re = $e
+        while ($re -lt $raw.Length -and ($raw[$re] -eq ' ' -or $raw[$re] -eq "`t")) { $re++ }
+        $runsToEol = $true
+        if ($re -lt $raw.Length) {
+            if ($raw[$re] -eq "`r") { $re++ }
+            if ($re -lt $raw.Length -and $raw[$re] -eq "`n") { $re++ }
+            else { $runsToEol = ($re -ge $raw.Length) }   # non-newline follows -> code after the comment
+        }
+
+        if ($lineLeading) {
+            # The comment owns the line: take indent, comment and newline. At EOF (no trailing
+            # newline) $re is simply the end of the file, which deletes just as cleanly.
+            if (-not $runsToEol) { $kept++; continue }   # e.g. `<#x#>code` at the start of a line
+            $ranges.Add([pscustomobject]@{ Start = $ls; End = $re })
+            $lineRemoved++
+        }
+        elseif ($IncludeTrailing -and $runsToEol) {
+            # Trailing comment after real code: drop the separating whitespace and the comment,
+            # but KEEP the newline so the code line stays a line.
+            $ranges.Add([pscustomobject]@{ Start = $ls; End = $e })
+            $trailingRemoved++
+        }
+        else {
+            $kept++
+        }
+    }
+
+    $out = $raw
+    if ($ranges.Count -gt 0) {
+        # Ranges are disjoint by construction (each whole-line delete consumes its own newline, so
+        # the next line's left-walk can not reach back into it) — coalescing is defensive and free.
+        $merged = Coalesce-Ranges $ranges
+        $sb = [System.Text.StringBuilder]::new($raw)
+        foreach ($r in ($merged | Sort-Object -Property Start -Descending)) {
+            [void]$sb.Remove($r.Start, $r.End - $r.Start)
+        }
+        $out = $sb.ToString()
+    }
+
+    [System.IO.File]::WriteAllText($OutputPath, $out)
+    return @{
+        changed                   = $lineRemoved + $trailingRemoved
+        comment_lines_removed     = $lineRemoved
+        trailing_comments_removed = $trailingRemoved
+        comments_kept             = $kept
+        input_bytes               = $inputLen
+        output_bytes              = $out.Length
+        output_path               = $OutputPath
+    }
+}
+
+# ---------------------------------------------------------------------------
 # Pass 9: Array-assembly join folding  ($v = @(); $v += @(...); $v -join 'sep')
 # ---------------------------------------------------------------------------
 
@@ -2249,6 +2961,39 @@ function Get-AllStringElements($exprAst) {
             }
         }
         return $null
+    }
+
+    # String char-selection: ("charset")[i,j,k] — a constant string indexed by one or
+    # more integer positions, yielding those characters. Obfuscators use it to spell a
+    # command/type name out of a scrambled alphabet, e.g.
+    # ("...Get...")[9,2,17,0,15,8,22,17,2,22,17] -join "" -> 'Get-Content'. Each selected
+    # char is returned as its own single-char string element, so the caller's
+    # `$fragments -join $sep` reproduces PowerShell's `("str")[i,j] -join "sep"` exactly.
+    # Array-index (returns a collection) lives here rather than in Resolve-Const, whose
+    # contract is scalar-only. Any non-constant target/index, or an out-of-range position,
+    # bails to $null — a missed fold, never a guess.
+    if ($exprAst -is [System.Management.Automation.Language.IndexExpressionAst]) {
+        $tgt = Resolve-Const $exprAst.Target $true $emptySet $emptySet
+        if (-not $tgt.Known -or $tgt.Value -isnot [string]) { return $null }
+        $s = [string]$tgt.Value
+
+        # Index is either an ArrayLiteralAst (i,j,k) or a single scalar expression.
+        $idxAsts = if ($exprAst.Index -is [System.Management.Automation.Language.ArrayLiteralAst]) {
+            $exprAst.Index.Elements
+        } else {
+            @($exprAst.Index)
+        }
+
+        $r = [System.Collections.Generic.List[string]]::new()
+        foreach ($idxAst in $idxAsts) {
+            $ir = Resolve-Const $idxAst $true $emptySet $emptySet
+            if (-not $ir.Known -or ($ir.Value -isnot [int] -and $ir.Value -isnot [long])) { return $null }
+            $i = [int]$ir.Value
+            if ($i -lt 0) { $i += $s.Length }            # PowerShell negative indexing
+            if ($i -lt 0 -or $i -ge $s.Length) { return $null }  # out of range -> bail
+            $r.Add([string]$s[$i])
+        }
+        return ,$r
     }
 
     # Scalar fallback: any single expression that Resolve-Const collapses to a string
@@ -2417,13 +3162,17 @@ function Invoke-PsFoldArrayJoins([string]$InputPath, [string]$OutputPath) {
         # Inline literal join: @('a','b',...) -join 'sep' (no variable indirection).
         # Disjoint from the variable-accumulator path above: that path owns joins whose
         # Left is a VariableExpressionAst; this one owns joins whose Left is an inline
-        # array literal, so the two never produce overlapping edit ranges.
+        # array literal, so the two never produce overlapping edit ranges. Also owns the
+        # string char-selection form ("charset")[i,j,...] -join 'sep' (Left is an
+        # IndexExpressionAst) — Get-AllStringElements resolves it to its selected chars;
+        # still disjoint from the variable/unary branches by Left node type.
         $inlineJoinNodes = @($sAst.FindAll({
             param($n)
             $n -is [System.Management.Automation.Language.BinaryExpressionAst] -and
             $n.Operator.ToString() -eq 'Join' -and
             ($n.Left -is [System.Management.Automation.Language.ArrayExpressionAst] -or
-             $n.Left -is [System.Management.Automation.Language.ArrayLiteralAst])
+             $n.Left -is [System.Management.Automation.Language.ArrayLiteralAst] -or
+             $n.Left -is [System.Management.Automation.Language.IndexExpressionAst])
         }, $true))
 
         foreach ($joinNode in $inlineJoinNodes) {
@@ -2704,12 +3453,13 @@ function Invoke-PsFoldCharConcat([string]$InputPath, [string]$OutputPath) {
         $sb = [System.Text.StringBuilder]::new()
         $allKnown = $true; $hasCharTerm = $false
         foreach ($t in $terms) {
-            if ($t -is [System.Management.Automation.Language.ConvertExpressionAst] -and
-                $t.Type.TypeName.FullName -match '(?i)^char$') { $hasCharTerm = $true }
             $rv = Resolve-Const $t $true $emptySet $emptySet   # strict, no var map: constants only
             if (-not $rv.Known -or $null -eq $rv.Value) { $allKnown = $false; break }
             $val = $rv.Value
-            if     ($val -is [char])   { [void]$sb.Append([char]$val) }
+            # Char-term detection is value-based, not AST-shape based: a term like ([char]80) is a
+            # ParenExpressionAst wrapping the [char] cast, so matching ConvertExpressionAst on the raw
+            # term misses every parenthesized/$(...)-wrapped char (the shape real obfuscators emit).
+            if     ($val -is [char])   { $hasCharTerm = $true; [void]$sb.Append([char]$val) }
             elseif ($val -is [string]) { [void]$sb.Append($val) }
             elseif ($val -is [int] -or $val -is [long] -or $val -is [byte] -or $val -is [double]) {
                 try { [void]$sb.Append([char][int]$val) } catch { $allKnown = $false; break }
@@ -3283,5 +4033,76 @@ function Invoke-PsUnflattenSwitch([string]$InputPath, [string]$OutputPath, [int]
         input_bytes     = $inputLen
         output_bytes    = $out.Length
         output_path     = $OutputPath
+    }
+}
+
+# ---------------------------------------------------------------------------
+# Pass: Unwrap opaque-predicate ifs whose condition is statically TRUE
+# ---------------------------------------------------------------------------
+
+# Mirror of Test-FalsyConst, inverted: is this expression provably truthy?
+# Unknown/complex values (arrays, objects, unresolved vars) conservatively return $false
+# (i.e. "don't touch it"), matching the rest of the library's don't-touch-what-we-can't-prove style.
+function Test-TruthyConst($exprAst, [bool]$hasStrictMode, $reservedVars, $assignedVars) {
+    $r = Resolve-Const $exprAst $hasStrictMode $reservedVars $assignedVars
+    if (-not $r.Known) { return $false }
+    $v = $r.Value
+    if ($null -eq $v)                                                            { return $false }
+    if ($v -is [bool])                                                           { return $v }
+    if ($v -is [int] -or $v -is [long] -or $v -is [double] -or $v -is [float])   { return $v -ne 0 }
+    if ($v -is [string])                                                         { return $v.Length -ne 0 }
+    return $false
+}
+
+function Invoke-PsUnwrapTrueIf([string]$InputPath, [string]$OutputPath) {
+    $raw    = [System.IO.File]::ReadAllText($InputPath)
+    $tokens = $null; $errors = $null
+    $ast    = [System.Management.Automation.Language.Parser]::ParseInput($raw, [ref]$tokens, [ref]$errors)
+
+    $reservedVars = [System.Collections.Generic.HashSet[string]]([System.StringComparer]::OrdinalIgnoreCase)
+    @('_','error','?','lastexitcode','matches','args','input','pscmdlet','psitem',
+      'true','false','null','pid','pwd','home','host','ofs','psscriptroot',
+      'pscommandpath','executioncontext','nestedpromptlevel','shellid') |
+      ForEach-Object { [void]$reservedVars.Add($_) }
+    $assignedVars = [System.Collections.Generic.HashSet[string]]([System.StringComparer]::OrdinalIgnoreCase)
+    foreach ($a in $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.AssignmentStatementAst] }, $true)) {
+        if ($a.Left -is [System.Management.Automation.Language.VariableExpressionAst]) {
+            [void]$assignedVars.Add($a.Left.VariablePath.UserPath.ToLowerInvariant())
+        }
+    }
+
+    # Only unwrap the simple, unambiguous case: a single-clause if (no elseif, no else) whose
+    # condition is statically true. elseif/else chains are left alone — reordering/dropping
+    # branches there risks changing semantics, which this pass deliberately avoids.
+    $reps = [System.Collections.Generic.List[pscustomobject]]::new()
+    foreach ($i in $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.IfStatementAst] }, $true)) {
+        if ($i.Clauses.Count -ne 1) { continue }
+        if ($null -ne $i.ElseClause) { continue }
+        $cond = Get-CondExpr $i.Clauses[0].Item1
+        if ($null -eq $cond) { continue }
+        if (-not (Test-TruthyConst $cond $false $reservedVars $assignedVars)) { continue }
+
+        $body  = $i.Clauses[0].Item2
+        $stmts = $body.Statements
+        $text  = ''
+        if ($stmts.Count -gt 0) {
+            $bs   = $stmts[0].Extent.StartOffset
+            $be   = $stmts[$stmts.Count - 1].Extent.EndOffset
+            $text = $raw.Substring($bs, $be - $bs)
+        }
+        $reps.Add([pscustomobject]@{ Start = $i.Extent.StartOffset; End = $i.Extent.EndOffset; Text = $text })
+    }
+
+    $out = $raw
+    foreach ($r in ($reps | Sort-Object Start -Descending)) {
+        $out = $out.Remove($r.Start, $r.End - $r.Start).Insert($r.Start, $r.Text)
+    }
+    [System.IO.File]::WriteAllText($OutputPath, $out)
+
+    return @{
+        changed      = $reps.Count
+        input_bytes  = $raw.Length
+        output_bytes = $out.Length
+        output_path  = $OutputPath
     }
 }

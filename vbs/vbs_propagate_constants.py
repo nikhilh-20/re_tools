@@ -5,6 +5,22 @@ on the RHS, records the value. Downstream reads of that variable in the same
 or later statements are replaced with the literal — provided the variable is
 not re-assigned to a non-constant or modified inside a block (If/For/While).
 
+Inside a block body, two regimes apply depending on the *kind* of every
+block currently open:
+
+  - Non-looping blocks (If/Select/With/Function/Sub/Class/Property): body
+    statements execute in a fixed straight-line order at most once per entry,
+    so a constant computed partway through (e.g. `Grejss = Reserveres` where
+    Reserveres is already known) is tracked in a scope-local env and folded
+    into later statements in the *same* straight-line run. This local scope
+    is cleared the instant any block opens or closes (depth changes), so it
+    never leaks across a branch/call boundary.
+  - Looping blocks (For/Do/While) anywhere in the current nesting: local
+    tracking is disabled entirely and the original fully-conservative
+    behaviour applies (every block-depth assignment is killed, never
+    folded), because a value computed from one iteration's inputs is not
+    generally valid for the next.
+
 Analog of PsPropagate-Constants.
 
 Usage:
@@ -43,6 +59,8 @@ def _one_pass(src: str) -> tuple[str, int, int]:
     # Track which names are "killed" (assigned non-constant or assigned inside a block)
     killed: set[str] = set()
     block_depth: int = 0  # nesting depth inside block structures
+    block_kinds: list[str] = []       # stack of 'LOOP' | 'OTHER' per open block
+    local_env: dict[str, Const] = {}  # straight-line-scoped constants inside a block
 
     edits: list[tuple[int, int, str]] = []
 
@@ -55,54 +73,102 @@ def _one_pass(src: str) -> tuple[str, int, int]:
 
         # Block closers: NEXT/LOOP/WEND each close exactly one level.
         if kw in ('NEXT', 'LOOP', 'WEND'):
+            if block_kinds:
+                block_kinds.pop()
             block_depth = max(0, block_depth - 1)
+            local_env.clear()
             continue
 
         # END closes one level only when followed by another keyword
-        # (END IF, END SUB, END FUNCTION, END WITH, END SELECT, END CLASS).
-        # Bare END (script terminator) does not change depth.
+        # (END IF, END SUB, END FUNCTION, END WITH, END SELECT, END CLASS,
+        # END PROPERTY). Bare END (script terminator) does not change depth.
         if kw == 'END':
             if len(ctoks) > 1 and ctoks[1].kind == TokenKind.IDENT:
+                if block_kinds:
+                    block_kinds.pop()
                 block_depth = max(0, block_depth - 1)
+                local_env.clear()
             continue
 
         # Block openers: kill any variable assigned in the header line, then
         # increment depth so body statements are processed differently below.
-        if kw in ('IF', 'FOR', 'DO', 'WHILE', 'SELECT', 'WITH',
-                  'FUNCTION', 'SUB', 'CLASS'):
+        # A single-line 'If c Then stmt' does NOT open a block (no matching
+        # End If ever follows it) — only the multi-line header form (ending
+        # in a bare THEN) does.
+        is_block_open = False
+        loop_open = False
+        if kw == 'IF':
+            last = ctoks[-1]
+            is_block_open = last.kind == TokenKind.IDENT and last.upper == 'THEN'
+        elif kw in ('FOR', 'DO', 'WHILE'):
+            is_block_open = True
+            loop_open = True
+        elif kw in ('SELECT', 'WITH', 'FUNCTION', 'SUB', 'CLASS', 'PROPERTY'):
+            is_block_open = True
+
+        if is_block_open:
             _kill_assignments(ctoks, env, killed)
+            block_kinds.append('LOOP' if loop_open else 'OTHER')
             block_depth += 1
+            local_env.clear()
             continue
 
         # --- Inside a block body (depth > 0) ---
         if block_depth > 0:
+            in_loop = 'LOOP' in block_kinds
             if _is_assignment(ctoks):
                 lhs_name, rhs_toks = _split_assignment(ctoks)
                 if lhs_name:
-                    # Kill LHS *before* substituting RHS so that a loop variable
-                    # that updates itself (h = h * 31 + ...) is not inlined with
-                    # its stale pre-loop constant value.
-                    killed.add(lhs_name.upper())
-                    env.pop(lhs_name.upper(), None)
-                    _substitute(rhs_toks, env, edits)
+                    lhs_up = lhs_name.upper()
+                    # Clear any local knowledge of this name *before*
+                    # substituting RHS so a self-referencing update reads
+                    # only its pre-this-statement value.
+                    local_env.pop(lhs_up, None)
+                    merged = env if in_loop else {**env, **local_env}
+                    # Outer/global env never retains a block-local write —
+                    # matches the original fully-conservative behaviour.
+                    killed.add(lhs_up)
+                    env.pop(lhs_up, None)
+                    rhs_toks_sub = _substitute(rhs_toks, merged, edits)
+                    if not in_loop:
+                        # Straight-line, non-looping block: safe to track
+                        # this as a local constant for later statements in
+                        # the same run (a value computed here executes
+                        # exactly once before any subsequent read of it).
+                        val = resolve_const(rhs_toks_sub, merged)
+                        if val is not None:
+                            local_env[lhs_up] = val
+                    # Inside a loop: never track (a value derived from one
+                    # iteration's inputs is not valid for the next).
             else:
-                _substitute(ctoks, env, edits)
+                merged = env if in_loop else {**env, **local_env}
+                _substitute(ctoks, merged, edits)
             continue
 
         # --- Top-level assignment: [Set|Dim] name = expr  OR  name = expr ---
         if _is_assignment(ctoks):
             lhs_name, rhs_toks = _split_assignment(ctoks)
             if lhs_name:
-                # Always substitute known constants into the RHS for readability.
-                rhs_toks_sub = _substitute(rhs_toks, env, edits)
-                if lhs_name.upper() not in killed:
-                    val = resolve_const(rhs_toks_sub, env)
+                lhs_up = lhs_name.upper()
+                # Self-append accumulator: VBScript's uninitialized Variant is Empty,
+                # which coerces to "" in a string expression.  When this is provably
+                # the first assignment to the name AND the RHS self-references it
+                # (e.g. X = X & "chunk"), seed it as "" so the whole chain folds.
+                sub_env = env
+                if (lhs_up not in env and lhs_up not in killed
+                        and _is_self_referencing(lhs_up, rhs_toks)):
+                    sub_env = dict(env)
+                    sub_env[lhs_up] = ''
+                # Substitute known constants into the RHS for readability.
+                rhs_toks_sub = _substitute(rhs_toks, sub_env, edits)
+                if lhs_up not in killed:
+                    val = resolve_const(rhs_toks_sub, sub_env)
                     if val is not None:
-                        env[lhs_name.upper()] = val
+                        env[lhs_up] = val
                     else:
                         # RHS not constant — kill the name
-                        killed.add(lhs_name.upper())
-                        env.pop(lhs_name.upper(), None)
+                        killed.add(lhs_up)
+                        env.pop(lhs_up, None)
                 # If lhs is already killed, we still substituted the rhs — nothing more to do.
             continue
 
@@ -183,6 +249,14 @@ def _substitute(ctoks: list, env: dict, edits: list) -> list:
         else:
             result.append(t)
     return result
+
+
+def _is_self_referencing(lhs_upper: str, rhs_toks: list) -> bool:
+    """Return True if *lhs_upper* appears as a bare IDENT in *rhs_toks*."""
+    return any(
+        t.kind == TokenKind.IDENT and t.upper == lhs_upper
+        for t in rhs_toks
+    )
 
 
 # VBScript keywords and built-in names that should never be substituted.

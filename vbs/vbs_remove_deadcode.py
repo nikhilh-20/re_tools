@@ -14,23 +14,31 @@ Default mode:
 --aggressive:
   Also removes unreferenced Function/Sub definitions whose name is never called.
 
+--remove-empty-loops:
+  Also removes empty-body Do/While loops whose condition contains no
+  parenthesized call (e.g. `Do While f.AtEndOfStream <> True / Loop` — a
+  common anti-sandbox stall). Off by default: such loops are IOC/TTP
+  evidence, so the default behaviour only flags them with a marker comment
+  rather than silently deleting them.
+
 Analog of PsRemove-DeadCode.
 
 Usage:
-    python vbs_remove_deadcode.py --input in.vbs --output out.vbs [--aggressive] [--preserve-strings]
+    python vbs_remove_deadcode.py --input in.vbs --output out.vbs [--aggressive] [--preserve-strings] [--remove-empty-loops]
 """
 import sys, os; sys.path.insert(0, os.path.dirname(__file__))
-import bisect
 import re
 from vbsdeoblib import tokenize, TokenKind, run_tool
 from vbsdeoblib.io import apply_edits
 from vbsdeoblib.resolver import resolve_const
+from vbsdeoblib.statements import split_statements, StatementSpan
 
 
-def run(src: str, aggressive: bool = False, preserve_strings: bool = False, **_) -> tuple[str, dict]:
+def run(src: str, aggressive: bool = False, preserve_strings: bool = False,
+        remove_empty_loops: bool = False, **_) -> tuple[str, dict]:
     changed_total = 0
     for _ in range(50):
-        src, n = _one_pass(src, aggressive, preserve_strings)
+        src, n = _one_pass(src, aggressive, preserve_strings, remove_empty_loops)
         changed_total += n
         if n == 0:
             break
@@ -41,13 +49,24 @@ def run(src: str, aggressive: bool = False, preserve_strings: bool = False, **_)
 # Top-level pass dispatcher
 # ---------------------------------------------------------------------------
 
-def _one_pass(src: str, aggressive: bool, preserve_strings: bool) -> tuple[str, int]:
+def _one_pass(src: str, aggressive: bool, preserve_strings: bool,
+              remove_empty_loops: bool) -> tuple[str, int]:
     # Sub-pass A: statically-false If blocks (no Else)
     edits = _false_if_edits(src)
 
     # Sub-pass B: statically-false Do While blocks
     if not edits:
         edits = _false_while_edits(src)
+
+    # Sub-pass B2: local dead-store elimination (sequential overwrite of the
+    # same variable before any intervening read — e.g. a var reassigned N
+    # times in a row for volume inflation, then fully overwritten).
+    if not edits:
+        edits = _local_dead_store_edits(src)
+
+    # Sub-pass B3: empty-body loop flagging / removal (see --remove-empty-loops).
+    if not edits:
+        edits = _empty_loop_edits(src, remove_empty_loops)
 
     # Sub-pass C: liveness-based dead-store removal (default mode)
     if not edits:
@@ -112,6 +131,68 @@ def _false_while_edits(src: str) -> list[tuple[int, int, str]]:
 
 
 # ---------------------------------------------------------------------------
+# Sub-pass B3: empty-body loop flagging / removal
+# ---------------------------------------------------------------------------
+
+_EMPTY_LOOP_MARKER = "' [deobfuscator] empty-body loop - likely anti-sandbox stall"
+
+# A blank-or-comment-only line, repeated zero or more times, is the body.
+_BLANK_OR_COMMENT_LINE = r"(?:[ \t]*(?:'[^\r\n]*)?\r?\n)*"
+
+_EMPTY_DO_PRETEST_PAT = re.compile(
+    r"(?im)^[ \t]*Do\s+(?:While|Until)\s+(.+?)\s*\r?\n"
+    + _BLANK_OR_COMMENT_LINE +
+    r"[ \t]*Loop\b[^\r\n]*"
+)
+_EMPTY_WHILE_WEND_PAT = re.compile(
+    r"(?im)^[ \t]*While\s+(.+?)\s*\r?\n"
+    + _BLANK_OR_COMMENT_LINE +
+    r"[ \t]*Wend\b[^\r\n]*"
+)
+_EMPTY_DO_POSTTEST_PAT = re.compile(
+    r"(?im)^[ \t]*Do[ \t]*\r?\n"
+    + _BLANK_OR_COMMENT_LINE +
+    r"[ \t]*Loop\s+(?:While|Until)\s+(.+?)[^\r\n]*"
+)
+
+_CALL_LIKE_RE = re.compile(r'[A-Za-z_]\w*\s*\(')
+
+
+def _condition_has_call(cond_text: str) -> bool:
+    """Heuristic purity check: does the loop condition contain something
+    that looks like a function/method call with arguments? A parenless
+    property read (e.g. '.AtEndOfStream') is treated as pure; this is a
+    documented heuristic, not a proof."""
+    return bool(_CALL_LIKE_RE.search(cond_text))
+
+
+def _already_flagged(src: str, pos: int) -> bool:
+    window_start = max(0, pos - 200)
+    return _EMPTY_LOOP_MARKER in src[window_start:pos]
+
+
+def _empty_loop_edits(src: str, remove: bool) -> list[tuple[int, int, str]]:
+    edits: list[tuple[int, int, str]] = []
+    for pat in (_EMPTY_DO_PRETEST_PAT, _EMPTY_WHILE_WEND_PAT, _EMPTY_DO_POSTTEST_PAT):
+        for m in pat.finditer(src):
+            cond_text = m.group(1).strip() if m.groups() else ''
+            indent = _line_indent(src, m.start())
+
+            if remove:
+                if _condition_has_call(cond_text):
+                    continue  # not safe to assume side-effect-free — leave alone
+                region = src[m.start(): m.end()]
+                extra_blank = '\n' * max(0, region.count('\n') - 1)
+                replacement = f"{indent}{_EMPTY_LOOP_MARKER}\n{extra_blank}"
+                edits.append((m.start(), m.end(), replacement))
+            else:
+                if _already_flagged(src, m.start()):
+                    continue
+                edits.append((m.start(), m.start(), f"{indent}{_EMPTY_LOOP_MARKER}\n"))
+    return edits
+
+
+# ---------------------------------------------------------------------------
 # Sub-pass C: liveness-based dead-store removal
 # ---------------------------------------------------------------------------
 
@@ -122,23 +203,12 @@ _lhs_re = re.compile(
     r'^[ \t]*(?:(?:Set|Let)\s+)?([A-Za-z_]\w*)[ \t]*=[^=<>]'
 )
 
-# Dim declaration line
-_dim_re = re.compile(r'(?i)^[ \t]*Dim\s+(.*)')
-
 # RHS has observable side effects: object creation or method call
 _side_effect_re = re.compile(r'(?i)(CreateObject|GetObject|\.\w+\s*\()')
 
-
-def _line_of(offset: int, line_offsets: list[int]) -> int:
-    """0-based line index for a byte offset (binary search over line_offsets)."""
-    return bisect.bisect_right(line_offsets, offset) - 1
-
-
-def _is_pure_literal(rhs: str) -> bool:
-    """True if rhs (the text after '=') is a single string or number literal."""
-    toks = [t for t in tokenize(rhs)
-            if t.kind not in (TokenKind.WS, TokenKind.NEWLINE, TokenKind.COMMENT)]
-    return len(toks) == 1 and toks[0].kind in (TokenKind.STRING, TokenKind.NUMBER)
+# Dynamic-dispatch constructs: their string arguments can reference a variable
+# by name without the tokenizer ever seeing an IDENT read for it.
+_DYNAMIC_EXEC_KW = frozenset(['EXECUTE', 'EXECUTEGLOBAL', 'EVAL', 'CALLBYNAME', 'GETREF'])
 
 
 def _build_line_offsets(lines: list[str]) -> list[int]:
@@ -148,109 +218,302 @@ def _build_line_offsets(lines: list[str]) -> list[int]:
     return offsets
 
 
+def _has_dynamic_exec(tokens: list) -> bool:
+    return any(t.kind == TokenKind.IDENT and t.upper in _DYNAMIC_EXEC_KW for t in tokens)
+
+
+def _word_present(name_upper: str, text: str) -> bool:
+    """Case-insensitive whole-identifier search (VBScript identifier chars == \\w)."""
+    return re.search(r'\b' + re.escape(name_upper) + r'\b', text, re.IGNORECASE) is not None
+
+
+def _names_referenced_in_strings(tokens: list, candidate_names: set) -> set:
+    """Subset of candidate_names that appear (word-boundary) inside any STRING
+    token's raw text. Used to protect names that are only 'read' dynamically,
+    e.g. via Execute("... Flerbrugerdrifternes ...")."""
+    if not candidate_names:
+        return set()
+    combined = '\n'.join(t.value for t in tokens if t.kind == TokenKind.STRING)
+    if not combined:
+        return set()
+    return {name for name in candidate_names if _word_present(name, combined)}
+
+
+def _is_pure_literal_toks(rhs_toks: list) -> bool:
+    """True if rhs_toks is a single string or number literal token."""
+    return len(rhs_toks) == 1 and rhs_toks[0].kind in (TokenKind.STRING, TokenKind.NUMBER)
+
+
+def _parse_dim_names(ctoks: list) -> list:
+    """Return the IDENT tokens declared by a 'Dim ...' statement's code tokens
+    (ctoks[0] is the DIM keyword). Array-dimensioned names (foo(n)) are
+    skipped entirely — never treated as removable."""
+    names: list = []
+    i = 1
+    n = len(ctoks)
+    while i < n:
+        t = ctoks[i]
+        if t.kind != TokenKind.IDENT:
+            i += 1
+            continue
+        j = i + 1
+        if j < n and ctoks[j].kind == TokenKind.OP and ctoks[j].value == '(':
+            depth = 1
+            k = j + 1
+            while k < n and depth > 0:
+                if ctoks[k].kind == TokenKind.OP and ctoks[k].value == '(':
+                    depth += 1
+                elif ctoks[k].kind == TokenKind.OP and ctoks[k].value == ')':
+                    depth -= 1
+                k += 1
+            i = k
+        else:
+            names.append(t)
+            i = j
+        if i < n and ctoks[i].kind == TokenKind.OP and ctoks[i].value == ',':
+            i += 1
+    return names
+
+
+def _line_indent(src: str, offset: int) -> str:
+    line_start = src.rfind('\n', 0, offset) + 1
+    prefix = src[line_start:offset]
+    return prefix if prefix.strip() == '' else ''
+
+
 def _dead_store_edits(src: str, preserve_strings: bool) -> list[tuple[int, int, str]]:
-    """Liveness-based: return edits for dead assignment lines + dead/partial Dim lines."""
-    edits: list[tuple[int, int, str]] = []
-    lines = src.splitlines(keepends=True)
-    if not lines:
-        return edits
+    """File-global liveness: return edits for assignment/Dim statements whose
+    name is never read anywhere else in the file. Statement-based (not
+    line-based) so line-continuations and colon-joined statements are handled
+    correctly; guarded against names that are only referenced dynamically
+    inside a string literal passed to Execute/ExecuteGlobal/Eval/CallByName/
+    GetRef (the tokenizer never sees those as IDENT reads)."""
+    tokens = tokenize(src)
+    stmts = split_statements(tokens)
+    if not stmts:
+        return []
 
-    line_offsets = _build_line_offsets(lines)
+    assign_stmts: list[tuple[str, StatementSpan, list]] = []   # (name_upper, stmt, rhs_toks)
+    dim_stmts: list[tuple[StatementSpan, list]] = []            # (stmt, [name_tok, ...])
+    lhs_offsets: set[int] = set()
+    dim_name_offsets: set[int] = set()
 
-    # --- Line scan: classify each line as assignment, Dim, or other ---
-    assigns: dict[str, list[int]] = {}  # name_upper -> [line_indices]
-    dim_info: dict[int, list[str]] = {}  # line_index -> [declared name list]
-    lhs_byte_offsets: set[int] = set()  # byte offsets of LHS ident tokens
-
-    for li, line in enumerate(lines):
-        m = _lhs_re.match(line)
-        if m:
-            name = m.group(1).upper()
-            if name not in _KW:
-                assigns.setdefault(name, []).append(li)
-                lhs_byte_offsets.add(line_offsets[li] + m.start(1))
+    for stmt in stmts:
+        ctoks = stmt.code_tokens()
+        if not ctoks:
             continue
+        kw0 = ctoks[0].upper if ctoks[0].kind == TokenKind.IDENT else ''
 
-        m = _dim_re.match(line)
-        if m:
-            raw = re.sub(r"'.*", '', m.group(1)).strip()  # strip trailing comment
-            names: list[str] = []
-            for part in raw.split(','):
-                n = part.strip()
-                if re.match(r'^[A-Za-z_]\w*$', n):
-                    names.append(n)
+        if kw0 == 'DIM':
+            names = _parse_dim_names(ctoks)
+            for nm in names:
+                dim_name_offsets.add(nm.start)
             if names:
-                dim_info[li] = names
-
-    # --- Find byte offsets of declared names in Dim lines ---
-    # Use the tokenizer so we match exactly what the lexer sees.
-    dim_line_set: frozenset[int] = frozenset(dim_info.keys())
-    src_toks = tokenize(src)
-
-    dim_token_starts: set[int] = set()
-    for tok in src_toks:
-        if tok.kind != TokenKind.IDENT or tok.upper == 'DIM':
+                dim_stmts.append((stmt, names))
             continue
-        li = _line_of(tok.start, line_offsets)
-        if li in dim_line_set:
-            dim_token_starts.add(tok.start)
 
-    # --- Collect reads ---
-    # Any IDENT token not at an LHS or Dim-declaration position is a read.
-    excluded_starts = lhs_byte_offsets | dim_token_starts
+        idx = 0
+        if ctoks[0].kind == TokenKind.IDENT and ctoks[0].upper in ('SET', 'LET'):
+            idx = 1
+        if (idx < len(ctoks) - 1 and ctoks[idx].kind == TokenKind.IDENT
+                and ctoks[idx + 1].kind == TokenKind.OP and ctoks[idx + 1].value == '='):
+            name_tok = ctoks[idx]
+            if name_tok.upper not in _KW:
+                assign_stmts.append((name_tok.upper, stmt, ctoks[idx + 2:]))
+                lhs_offsets.add(name_tok.start)
+        # Anything else (Call, single-line If, bare expression, ...): all of
+        # its IDENT tokens fall through to the read-scan below.
+
+    # --- Collect reads: any IDENT token outside recognized LHS/Dim positions ---
+    excluded = lhs_offsets | dim_name_offsets
     reads: set[str] = set()
-    for tok in src_toks:
-        if (tok.kind == TokenKind.IDENT
-                and tok.upper not in _KW
-                and tok.start not in excluded_starts):
-            reads.add(tok.upper)
+    for t in tokens:
+        if t.kind == TokenKind.IDENT and t.upper not in _KW and t.start not in excluded:
+            reads.add(t.upper)
 
-    # --- Compute dead names ---
-    all_dim_names: set[str] = {
-        n.upper() for names in dim_info.values() for n in names
-    }
-    dead: set[str] = {
-        n for n in (set(assigns.keys()) | all_dim_names)
-        if n not in reads
-    }
+    all_dim_names: set[str] = {nm.upper for _, names in dim_stmts for nm in names}
+    assign_names: set[str] = {name for name, _, _ in assign_stmts}
+    dead: set[str] = {n for n in (assign_names | all_dim_names) if n not in reads}
 
     if not dead:
-        return edits
+        return []
 
-    # --- Emit edits for dead assignment lines ---
-    for name, line_indices in assigns.items():
+    # Guard: names only referenced from inside a string literal (potential
+    # dynamic read via Execute/Eval/etc.) are not safe to remove.
+    if _has_dynamic_exec(tokens):
+        dead -= _names_referenced_in_strings(tokens, dead)
+    if not dead:
+        return []
+
+    edits: list[tuple[int, int, str]] = []
+    for name, stmt, rhs_toks in assign_stmts:
         if name not in dead:
             continue
-        for li in line_indices:
-            line = lines[li]
-            m = _lhs_re.match(line)
-            if not m:
-                continue
-            # Extract RHS text (everything after the '=')
-            eq_pos = line.index('=', m.end(1))
-            rhs = line[eq_pos + 1:]
-            # Purity gate: keep lines whose RHS has observable side effects
-            if _side_effect_re.search(rhs):
-                continue
-            # Optional preserve-strings gate (mirrors PS PreserveStringLiterals)
-            if preserve_strings and _is_pure_literal(rhs):
-                continue
-            off = line_offsets[li]
-            edits.append((off, off + len(line), ''))
+        rhs_start = rhs_toks[0].start if rhs_toks else stmt.end
+        rhs_src = src[rhs_start: stmt.end]
+        if _side_effect_re.search(rhs_src):
+            continue
+        if preserve_strings and _is_pure_literal_toks(rhs_toks):
+            continue
+        edits.append((stmt.start, stmt.end, ''))
 
-    # --- Emit edits for dead/partial Dim lines ---
-    for li, names in dim_info.items():
-        live_names = [n for n in names if n.upper() not in dead]
+    for stmt, names in dim_stmts:
+        live_names = [nm.value for nm in names if nm.upper not in dead]
         if len(live_names) == len(names):
             continue  # all live, no change
-        line = lines[li]
-        off = line_offsets[li]
         if not live_names:
-            edits.append((off, off + len(line), ''))
+            edits.append((stmt.start, stmt.end, ''))
         else:
-            indent = re.match(r'^[ \t]*', line).group(0)
-            eol = '\r\n' if line.endswith('\r\n') else '\n'
-            edits.append((off, off + len(line), f'{indent}Dim {", ".join(live_names)}{eol}'))
+            indent = _line_indent(src, stmt.start)
+            edits.append((stmt.start, stmt.end, f'{indent}Dim {", ".join(live_names)}'))
+
+    return edits
+
+
+# ---------------------------------------------------------------------------
+# Sub-pass B2: local (sequential-overwrite) dead-store elimination
+# ---------------------------------------------------------------------------
+
+def _match_simple_assignment(ctoks: list) -> tuple[str, list] | None:
+    """Return (name_upper, rhs_tokens) for a bare 'name = rhs' or 'Let name =
+    rhs' statement. Returns None for Dim/Const/ReDim/Set forms (object refs
+    and non-reassignable declarations are never local dead-store candidates)."""
+    if not ctoks:
+        return None
+    if ctoks[0].kind == TokenKind.IDENT and ctoks[0].upper in ('DIM', 'CONST', 'REDIM', 'SET'):
+        return None
+    idx = 1 if (ctoks[0].kind == TokenKind.IDENT and ctoks[0].upper == 'LET') else 0
+    if idx >= len(ctoks) - 1:
+        return None
+    name_tok, eq_tok = ctoks[idx], ctoks[idx + 1]
+    if name_tok.kind != TokenKind.IDENT or name_tok.upper in _KW:
+        return None
+    if not (eq_tok.kind == TokenKind.OP and eq_tok.value == '='):
+        return None
+    return name_tok.upper, ctoks[idx + 2:]
+
+
+_PROC_PAT = re.compile(
+    r'(?im)^[ \t]*(?:Function|Sub|Class)\s+\w+\s*(?:\([^)]*\))?[^\r\n]*\r?\n'
+    r'(?:(?![ \t]*End\s+(?:Function|Sub|Class))[^\r\n]*\r?\n)*'
+    r'[ \t]*End\s+(?:Function|Sub|Class)\b[^\r\n]*'
+)
+_PROPERTY_PAT = re.compile(
+    r'(?im)^[ \t]*Property\s+(?:Get|Let|Set)\s+\w+\s*(?:\([^)]*\))?[^\r\n]*\r?\n'
+    r'(?:(?![ \t]*End\s+Property)[^\r\n]*\r?\n)*'
+    r'[ \t]*End\s+Property\b[^\r\n]*'
+)
+
+
+def _proc_body_ranges(src: str) -> list[tuple[int, int]]:
+    """Byte ranges of every Function/Sub/Class/Property body in the file."""
+    ranges = [(m.start(), m.end()) for m in _PROC_PAT.finditer(src)]
+    ranges += [(m.start(), m.end()) for m in _PROPERTY_PAT.finditer(src)]
+    return ranges
+
+
+def _local_dead_store_edits(src: str) -> list[tuple[int, int, str]]:
+    """Remove a store to X when a later unconditional top-level store to X
+    exists with no intervening read of X anywhere (at any nesting depth) —
+    e.g. a variable reassigned N times in a row for volume inflation, where
+    only the final assignment before first use matters.
+
+    Safety conditions (see plan): (1) the removed store's RHS must resolve to
+    a pure constant [resolve_const], (2) both stores occur at module top
+    level (block_depth == 0 for both, which — because block open/close is
+    tracked exactly — also guarantees any intervening blocks are balanced),
+    (3) no read of X anywhere between them regardless of depth, (4) X is not
+    read inside any Function/Sub/Class/Property body anywhere in the file
+    (no call-graph analysis; conservative file-wide guard), (5) X does not
+    appear inside any string literal when dynamic-exec constructs are present
+    in the file, (6) Const/ReDim/Set-prefixed forms are excluded outright.
+    """
+    tokens = tokenize(src)
+    stmts = split_statements(tokens)
+    if not stmts:
+        return []
+
+    dynamic_exec = _has_dynamic_exec(tokens)
+    proc_ranges = _proc_body_ranges(src)
+
+    pending: dict[str, StatementSpan] = {}
+    dead_candidates: list[tuple[str, StatementSpan]] = []
+    depth = 0
+
+    for stmt in stmts:
+        ctoks = stmt.code_tokens()
+        if not ctoks:
+            continue
+        kw = ctoks[0].upper if ctoks[0].kind == TokenKind.IDENT else ''
+
+        if kw in ('NEXT', 'LOOP', 'WEND'):
+            depth = max(0, depth - 1)
+            continue
+        if kw == 'END':
+            if len(ctoks) > 1 and ctoks[1].kind == TokenKind.IDENT:
+                depth = max(0, depth - 1)
+            continue
+
+        is_block_open = False
+        if kw == 'IF':
+            # Multi-line 'If ... Then' block header ends with a bare THEN;
+            # single-line 'If c Then stmt' does not open a block at all.
+            last = ctoks[-1]
+            is_block_open = last.kind == TokenKind.IDENT and last.upper == 'THEN'
+        elif kw in ('FOR', 'DO', 'WHILE', 'SELECT', 'WITH', 'FUNCTION', 'SUB', 'CLASS', 'PROPERTY'):
+            is_block_open = True
+
+        cur_depth = depth
+        if is_block_open:
+            depth += 1
+
+        assign = _match_simple_assignment(ctoks) if (cur_depth == 0 and not is_block_open) else None
+
+        if assign is not None:
+            name, rhs_toks = assign
+            # Reads inside the RHS (including self-reference) clear pending
+            # entries *before* we consider this a fresh overwrite.
+            for t in rhs_toks:
+                if t.kind == TokenKind.IDENT and t.upper not in _KW:
+                    pending.pop(t.upper, None)
+            if name in pending:
+                dead_candidates.append((name, pending[name]))
+            if resolve_const(rhs_toks) is not None:
+                pending[name] = stmt
+            else:
+                pending.pop(name, None)
+        else:
+            # Any other statement (block header/closer, non-assignment
+            # top-level statement, or a statement inside a block): every
+            # identifier it mentions conservatively clears pending — a read,
+            # a conditional write, or anything in between is treated the
+            # same way (losing an optimization opportunity is always safe;
+            # removing a live store is not).
+            for t in ctoks:
+                if t.kind == TokenKind.IDENT and t.upper not in _KW:
+                    pending.pop(t.upper, None)
+
+    if not dead_candidates:
+        return []
+
+    names_needed = {name for name, _ in dead_candidates}
+
+    proc_read_names: set[str] = set()
+    if proc_ranges:
+        for t in tokens:
+            if t.kind == TokenKind.IDENT and t.upper in names_needed:
+                if any(a <= t.start < b for a, b in proc_ranges):
+                    proc_read_names.add(t.upper)
+
+    stringy_names: set[str] = set()
+    if dynamic_exec:
+        stringy_names = _names_referenced_in_strings(tokens, names_needed)
+
+    edits: list[tuple[int, int, str]] = []
+    for name, stmt in dead_candidates:
+        if name in proc_read_names or name in stringy_names:
+            continue
+        edits.append((stmt.start, stmt.end, ''))
 
     return edits
 
@@ -293,29 +556,22 @@ def _unused_func_edits(src: str) -> list[tuple[int, int, str]]:
         return False
 
     # Collect call-site reads: IDENT tokens outside all definition blocks and LHS positions
+    all_tokens = tokenize(src)
     call_reads: set[str] = set()
-    str_content: str = src.lower()  # for dynamic-dispatch string check
-    for tok in tokenize(src):
+    for tok in all_tokens:
         if tok.kind == TokenKind.IDENT and tok.upper not in _KW:
             if tok.start not in lhs_byte_offsets and not in_any_def(tok.start):
                 call_reads.add(tok.upper)
 
+    candidate_names = {fn_name for fn_name, _, _ in defs
+                        if fn_name not in _KW and fn_name not in call_reads}
+    # Safety: a name only reachable via a word-boundary match inside a string
+    # literal may be dynamically dispatched (Execute/CallByName/GetRef/...).
+    stringy_names = _names_referenced_in_strings(all_tokens, candidate_names)
+
     for fn_name, start, end in defs:
-        if fn_name in _KW:
+        if fn_name in _KW or fn_name in call_reads or fn_name in stringy_names:
             continue
-        if fn_name in call_reads:
-            continue
-        # Safety: if the name appears inside a string literal, skip removal
-        # (may be dynamically dispatched via Execute/CallByName)
-        if fn_name.lower() in str_content:
-            # Quick check: does any STRING token contain it?
-            found_in_string = False
-            for tok in tokenize(src):
-                if tok.kind == TokenKind.STRING and fn_name.lower() in tok.value.lower():
-                    found_in_string = True
-                    break
-            if found_in_string:
-                continue
         region = src[start:end]
         blank = '\n' * region.count('\n')
         edits.append((start, end, blank))
@@ -345,6 +601,12 @@ if __name__ == '__main__':
                 'action': 'store_true',
                 'default': False,
                 'help': 'Keep string/number literal RHS assignments even when the LHS is dead',
+            },
+            {
+                'flags': ['--remove-empty-loops'],
+                'action': 'store_true',
+                'default': False,
+                'help': 'Remove (rather than just flag) empty-body loops with a call-free condition',
             },
         ],
     )

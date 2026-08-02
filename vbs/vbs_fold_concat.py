@@ -39,7 +39,7 @@ def _one_pass(src: str, env: dict) -> tuple[str, int]:
         if tok.kind in (TokenKind.STRING, TokenKind.COMMENT):
             i += 1
             continue
-        if tok.kind == TokenKind.OP and tok.value == '&' and i not in used:
+        if tok.kind == TokenKind.OP and tok.value in ('&', '+') and i not in used:
             # Walk left and right to find the full & chain.
             # The "chain" is a series of atoms separated by '&' at the same paren level.
             left, right = _expand_concat_chain(tokens, i)
@@ -49,12 +49,12 @@ def _one_pass(src: str, env: dict) -> tuple[str, int]:
                     val = resolve_const(span, env)
                     if val is not None:
                         # Must actually contain an '&' (not just a single literal)
-                        has_amp = any(
-                            t.kind == TokenKind.OP and t.value == '&'
+                        has_amp_or_plus = any(
+                            t.kind == TokenKind.OP and t.value in ('&', '+')
                             for t in span
                             if t.kind not in (TokenKind.WS, TokenKind.COMMENT)
                         )
-                        if has_amp:
+                        if has_amp_or_plus and isinstance(val, str):
                             rep = quote_vbs(str(val))
                             edits.append((tokens[left].start, tokens[right].end, rep))
                             for idx in range(left, right+1):
@@ -159,11 +159,11 @@ def _expand_concat_chain(tokens: list, amp_idx: int) -> tuple[int | None, int | 
     chain_left  = left_atom
     chain_right = right_atom
 
-    # Expand leftward: if the left-atom is preceded by '&', include that chain.
+    # Expand leftward: if the left-atom is preceded by '&' or '+', include that chain.
     cur = chain_left
     while True:
         la = skip_ws_left(cur)
-        if la < 0 or not (tokens[la].kind == TokenKind.OP and tokens[la].value == '&'):
+        if la < 0 or not (tokens[la].kind == TokenKind.OP and tokens[la].value in ('&', '+')):
             break
         new_left = find_atom_left(la)
         if new_left is None:
@@ -175,7 +175,7 @@ def _expand_concat_chain(tokens: list, amp_idx: int) -> tuple[int | None, int | 
     cur = chain_right
     while True:
         ra = skip_ws_right(cur)
-        if ra >= n or not (tokens[ra].kind == TokenKind.OP and tokens[ra].value == '&'):
+        if ra >= n or not (tokens[ra].kind == TokenKind.OP and tokens[ra].value in ('&', '+')):
             break
         new_right = find_atom_right(ra)
         if new_right is None:

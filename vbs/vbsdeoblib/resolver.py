@@ -76,11 +76,25 @@ def _vbs_replace(s, find, repl, *rest):
 
 def _vbs_instr(*args):
     if len(args) == 2:
-        s, sub = str(args[0]), str(args[1])
-        idx = s.find(sub)
+        start, s, sub, compare = 1, args[0], args[1], 0
     else:
-        start, s, sub = int(args[0])-1, str(args[1]), str(args[2])
-        idx = s.find(sub, start)
+        start, s, sub = args[0], args[1], args[2]
+        compare = args[3] if len(args) > 3 else 0
+
+    start = round(_numeric(start))        # VBS coerces to Long (banker's rounding)
+    compare = int(_numeric(compare))
+    if start < 1:
+        raise ValueError('InStr start < 1 is a VBScript runtime error')
+    if compare not in (0, 1):
+        raise ValueError('unsupported compare mode')   # e.g. vbDatabaseCompare
+
+    s, sub = str(s), str(sub)
+    if s == '':          return 0        # string1 zero-length
+    if start > len(s):   return 0        # start past end of string1
+    if sub == '':        return start    # string2 zero-length -> start
+
+    hay, needle = (s.lower(), sub.lower()) if compare == 1 else (s, sub)
+    idx = hay.find(needle, start - 1)
     return idx + 1 if idx >= 0 else 0  # 1-indexed, 0 = not found
 
 def _vbs_string(n, c):

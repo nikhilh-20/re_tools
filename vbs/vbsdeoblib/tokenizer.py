@@ -67,6 +67,8 @@ _PATTERNS: list[tuple[TokenKind, re.Pattern[str]]] = [
     (TokenKind.NEWLINE, re.compile(r'\r?\n')),
     # Comments: single-quote style.
     (TokenKind.COMMENT, re.compile(r"'[^\r\n]*")),
+    # Statement separator.
+    (TokenKind.COLON,   re.compile(r':')),
     # Multi-char operators first, then single-char.
     (TokenKind.OP,      re.compile(r'<>|<=|>=')),
     (TokenKind.OP,      re.compile(r'[&+\-*/\\^=<>()\[\],\.#]')),
@@ -83,7 +85,7 @@ def _check_rem_comment(tokens: list[VbsToken], src: str, pos: int) -> int | None
     Returns None if this is not a REM comment."""
     # Already added to tokens; peek at what precedes it: if the previous
     # non-WS token on this logical line is NEWLINE, COLON, or nothing, it's REM.
-    preceding = [t for t in tokens if t.kind not in (TokenKind.WS,)]
+    preceding = [t for t in tokens[:-1] if t.kind not in (TokenKind.WS,)]
     if preceding and preceding[-1].kind not in (TokenKind.NEWLINE, TokenKind.COLON):
         return None
     # Consume to end of line.

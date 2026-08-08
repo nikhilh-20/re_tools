@@ -193,14 +193,24 @@ def _kill_assignments(ctoks: list, env: dict, killed: set) -> None:
             env.pop(name, None)
 
 
+def _leading_skip(ctoks: list) -> int:
+    """Number of leading modifier tokens to skip before the declared name,
+    e.g. 'Dim x', 'Set x', 'Const x', or 'Public Const x' / 'Private Const x'."""
+    start = 0
+    if (ctoks[start].kind == TokenKind.IDENT and ctoks[start].upper in ('PUBLIC', 'PRIVATE')
+            and start + 1 < len(ctoks) and ctoks[start + 1].kind == TokenKind.IDENT
+            and ctoks[start + 1].upper == 'CONST'):
+        start += 1
+    if start < len(ctoks) and ctoks[start].kind == TokenKind.IDENT and ctoks[start].upper in ('DIM', 'SET', 'LET', 'CONST'):
+        start += 1
+    return start
+
+
 def _is_assignment(ctoks: list) -> bool:
     """Return True if this looks like a simple top-level assignment."""
     if not ctoks:
         return False
-    start = 0
-    # Skip optional Dim / Set
-    if ctoks[0].kind == TokenKind.IDENT and ctoks[0].upper in ('DIM', 'SET', 'LET', 'CONST'):
-        start = 1
+    start = _leading_skip(ctoks)
     if start >= len(ctoks):
         return False
     # Next should be IDENT = ...
@@ -214,9 +224,7 @@ def _is_assignment(ctoks: list) -> bool:
 
 def _split_assignment(ctoks: list) -> tuple[str | None, list]:
     """Return (lhs_name, rhs_tokens) for a simple assignment, or (None, [])."""
-    start = 0
-    if ctoks[0].kind == TokenKind.IDENT and ctoks[0].upper in ('DIM', 'SET', 'LET', 'CONST'):
-        start = 1
+    start = _leading_skip(ctoks)
     if start + 2 > len(ctoks):
         return None, []
     lhs = ctoks[start]

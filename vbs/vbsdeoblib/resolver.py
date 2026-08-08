@@ -134,6 +134,29 @@ PURE_BUILTINS: dict[str, tuple[int, int, object]] = {
 }
 
 # ---------------------------------------------------------------------------
+# VBScript intrinsic (reserved) constants — always resolvable, never
+# user-assignable, so recognised unconditionally like TRUE/FALSE/NOTHING
+# rather than routed through the caller-supplied env.
+# ---------------------------------------------------------------------------
+_INTRINSIC_CONSTANTS: dict[str, Const] = {
+    # String/char constants
+    'VBCR':            '\r',
+    'VBCRLF':          '\r\n',
+    'VBFORMFEED':      '\f',
+    'VBLF':            '\n',
+    'VBNEWLINE':       '\r\n',
+    'VBNULLCHAR':      '\0',
+    'VBNULLSTRING':    '',
+    'VBTAB':           '\t',
+    'VBVERTICALTAB':   '\v',
+    'VBBACK':          '\b',
+    # Comparison-mode constants
+    'VBBINARYCOMPARE': 0,
+    'VBTEXTCOMPARE':   1,
+    'VBDATABASECOMPARE': 2,
+}
+
+# ---------------------------------------------------------------------------
 # Recursive-descent expression parser / evaluator
 # ---------------------------------------------------------------------------
 
@@ -342,6 +365,9 @@ class _Parser:
             if up in ('NOTHING', 'NULL', 'EMPTY'):
                 self._consume()
                 return ''
+            if up in _INTRINSIC_CONSTANTS:
+                self._consume()
+                return _INTRINSIC_CONSTANTS[up]
 
             # Function call or variable reference
             name = t.value

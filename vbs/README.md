@@ -1,6 +1,6 @@
 # VBScript Deobfuscation Toolkit
 
-A field reference for the 16 utilities in this folder. Each is a thin CLI wrapper
+A field reference for the 18 utilities in this folder. Each is a thin CLI wrapper
 over shared library code in `vbsdeoblib/`. Every utility targets **one** obfuscation
 technique (or one supporting cleanup), so you chain them by hand.
 
@@ -29,6 +29,8 @@ technique (or one supporting cleanup), so you chain them by hand.
 | Arithmetic junk: `(18*2-(13-17))+32` | **vbs_fold_arithmetic** |
 | String fragments joined by `&` or `+`: `"He" & "ll" & "o"` / `"He" + "ll" + "o"` | **vbs_fold_concat** |
 | Calls to pure builtins with constant args: `Replace("W@S","@","")`, `Mid("abc",2,1)` | **vbs_fold_builtin_calls** |
+| `Split("a,b,c", ",")` with constant args | **vbs_fold_split_calls** |
+| `accum = ""` / `For i = 0 To UBound(arr)` / `accum = accum & arr(i)` / `Next` over a literal `Array(...)` | **vbs_fold_array_join_loops** |
 | User-defined single-expression wrapper function: `Function ttaffRy(s): ttaffRy = Replace(s,"@","")` | **vbs_inline_functions** |
 | A variable assigned a constant once, then referenced many times | **vbs_propagate_constants** |
 | `If (5 > 3) Then ... End If` always-true wrapper | **vbs_unwrap_trueif** |
@@ -119,6 +121,108 @@ wrong value whenever VBScript semantics are ambiguous or would raise at runtime:
 (vbBinaryCompare) or `1` (vbTextCompare). Supported cases correctly return `0` for a
 zero-length first argument or a `start` past its end, and the `start` position itself
 for a zero-length second argument.
+
+### vbs_fold_split_calls
+Folds `Split(expression[, delimiter[, limit[, compare]]])` calls to an `Array(...)`
+literal when every supplied argument resolves to a constant via the shared resolver.
+`Split()` returns an array rather than a scalar, so it doesn't fit `resolve_const`'s
+scalar `Const` contract and isn't part of `PURE_BUILTINS` — this tool resolves each
+argument independently and computes the real VBScript `Split` result itself. The
+replacement `Array(...)` call is a genuine VBScript expression that behaves
+identically to the original `Split()` result for every downstream consumer
+(`UBound`, indexing, `For ... Next`), so it's a safe drop-in.
+
+Defeats a common string-shattering technique: a payload string is broken apart with a
+throwaway delimiter and `Split` back into an array, then reassembled with a loop —
+purely to keep the literal string from appearing contiguous to static scanners:
+```vbs
+prostatotomies = Split("H)))e)))l)))l)))o", ")))")
+hills = ""
+For i = 0 To UBound(prostatotomies)
+    hills = hills & prostatotomies(i)
+Next
+```
+```vbs
+prostatotomies = Array("H", "e", "l", "l", "o")
+hills = ""
+For i = 0 To UBound(prostatotomies)
+    hills = hills & prostatotomies(i)
+Next
+```
+(Reassembling the `For` loop into a single string literal is a separate, join-loop
+obfuscation pattern this tool does not address.)
+
+**Signature semantics implemented, matching real VBScript `Split` exactly:**
+
+| Case | Result |
+|---|---|
+| `expression` is `""` | single-element array containing `""` (not a zero-element array) |
+| `delimiter` is `""` | single-element array containing the whole `expression` |
+| `delimiter` omitted | defaults to `" "` |
+| `limit` omitted | defaults to `-1` (no limit) |
+| `limit = 0` | zero-element array |
+| `limit > 0` | at most `limit` elements; the last one holds the unsplit remainder |
+| `compare` omitted | defaults to `0` (`vbBinaryCompare`) |
+| `compare = 1` | case-insensitive split (`vbTextCompare`) |
+| `compare` resolves to anything else | declines to fold (leaves the call untouched) rather than guess, same convention `vbs_fold_builtin_calls`'s `InStr` folding uses for unsupported compare modes |
+
+Same guards as **vbs_fold_builtin_calls**: a call preceded by `.` (member access,
+e.g. `oRE.Split(...)`) and a call to a name the script itself redefines via
+`Function`/`Sub` are left untouched. If any *supplied* argument fails to resolve to a
+constant (e.g. a variable delimiter that isn't itself known), the whole call is left
+untouched.
+
+### vbs_fold_array_join_loops
+Folds the other half of the "shatter a string, reassemble it with a loop" idiom that
+**vbs_fold_split_calls** produces the first half of. Targets exactly:
+```vbs
+accum = "<const>"
+For idx = <constStart> To UBound(arrName)
+accum = accum & arrName(idx)
+Next
+```
+Since `arrName`'s contents and the iteration count are both statically known once
+`arrName`'s nearest prior write is a literal `arrName = Array(e0, e1, ...)` with every
+element constant, the entire loop's effect is computable ahead of time — the whole
+block (initializer through `Next`) collapses to one `accum = "<joined literal>"`.
+
+Input → Output:
+```vbs
+prostatotomies = Array("H", "e", "l", "l", "o")
+hills = ""
+For asepta = 0 To UBound(prostatotomies)
+hills = hills & prostatotomies(asepta)
+Next
+```
+```vbs
+prostatotomies = Array("H", "e", "l", "l", "o")
+hills = "Hello"
+```
+(The now-unused `prostatotomies` array is left in place — that's
+**vbs_remove_deadcode**'s job once nothing reads it anymore.)
+
+**Deliberately narrow match, aborts (leaves the loop untouched) on any deviation:**
+- The `For` header must be exactly `For idx = startExpr To UBound(arrName)`, optionally
+  with `Step stepExpr` — `stepExpr` must resolve to `1`; anything else (a different
+  function than `UBound`, extra `UBound` args, arithmetic around it) is rejected.
+  `startExpr` must resolve to a constant non-negative integer; the array elements are
+  sliced from that index (covers the common `start = 0` case and a "skip the first N"
+  variant for free).
+- The loop body must be **exactly one statement**: `accum = accum (&|+) arrName(idx)`
+  with matching identifiers throughout. A loop with extra statements, or a different
+  shape, is left alone.
+- `arrName`'s **nearest** prior write (scanning backward) must be a literal
+  `Array(...)` call with every element constant — if it was reassigned to anything else
+  in between, or never assigned, the fold is declined.
+- The **immediately preceding** real statement before the `For` header must be
+  `accum = <constExpr>` — required, not defaulted to `""` (unlike
+  **vbs_propagate_constants**'s self-append seeding), since a missing initializer more
+  plausibly means `accum` already carries some other live value this tool can't see.
+
+Matching is done via `split_statements` + `FOR`/`NEXT` depth tracking (same technique
+`vbs_remove_deadcode`'s local dead-store pass uses), not regex — this pattern spans
+several statements and needs real block-nesting awareness so an unrelated nested `For`
+inside the body is never mistaken for the loop's own closing `Next`.
 
 ### vbs_inline_functions
 Inlines user-defined single-expression wrapper functions by parameter substitution at

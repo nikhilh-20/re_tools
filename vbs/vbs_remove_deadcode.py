@@ -13,6 +13,11 @@ Default mode:
 
 --aggressive:
   Also removes unreferenced Function/Sub definitions whose name is never called.
+  Also treats self-referential accumulator chains (e.g. `x = x & f()` repeated,
+  with x never read outside its own writer statements) as dead: a variable is
+  removed if every read of it is confined to its own writer statements, even
+  though it "reads itself" on every line. Off by default because it changes
+  what counts as live, not just what counts as reachable.
 
 --remove-empty-loops:
   Also removes empty-body Do/While loops whose condition contains no
@@ -68,9 +73,10 @@ def _one_pass(src: str, aggressive: bool, preserve_strings: bool,
     if not edits:
         edits = _empty_loop_edits(src, remove_empty_loops)
 
-    # Sub-pass C: liveness-based dead-store removal (default mode)
+    # Sub-pass C: liveness-based dead-store removal (default mode); with
+    # --aggressive, also catches self-contained self-referential clusters.
     if not edits:
-        edits = _dead_store_edits(src, preserve_strings)
+        edits = _dead_store_edits(src, preserve_strings, aggressive)
 
     # Sub-pass D: unreferenced Function/Sub removal (--aggressive only)
     if not edits and aggressive:
@@ -222,6 +228,32 @@ def _has_dynamic_exec(tokens: list) -> bool:
     return any(t.kind == TokenKind.IDENT and t.upper in _DYNAMIC_EXEC_KW for t in tokens)
 
 
+def _rhs_has_side_effect(rhs_toks: list, src: str, rhs_end: int) -> bool:
+    """Side-effect scan restricted to live code: STRING token spans are
+    blanked out first so text that merely looks like '.Method(' or
+    'CreateObject' inside a string argument (e.g. an embedded PowerShell/JS
+    payload passed to Replace()) isn't mistaken for an actual VBScript call
+    performed by the assignment statement itself.
+
+    Exception: if the RHS's own live code invokes a dynamic-dispatch
+    construct (Execute/ExecuteGlobal/Eval/CallByName/GetRef), a string
+    argument to it may genuinely execute as code (e.g.
+    Eval("CreateObject(...)")), so fall back to the old unblanked scan
+    rather than risk deleting a statement with a real side effect."""
+    if not rhs_toks:
+        return False
+    rhs_start = rhs_toks[0].start
+    rhs_src = src[rhs_start:rhs_end]
+    if _has_dynamic_exec(rhs_toks):
+        return bool(_side_effect_re.search(rhs_src))
+    chars = list(rhs_src)
+    for t in rhs_toks:
+        if t.kind == TokenKind.STRING:
+            for i in range(t.start - rhs_start, t.end - rhs_start):
+                chars[i] = ' '
+    return bool(_side_effect_re.search(''.join(chars)))
+
+
 def _word_present(name_upper: str, text: str) -> bool:
     """Case-insensitive whole-identifier search (VBScript identifier chars == \\w)."""
     return re.search(r'\b' + re.escape(name_upper) + r'\b', text, re.IGNORECASE) is not None
@@ -244,11 +276,16 @@ def _is_pure_literal_toks(rhs_toks: list) -> bool:
     return len(rhs_toks) == 1 and rhs_toks[0].kind in (TokenKind.STRING, TokenKind.NUMBER)
 
 
-def _parse_dim_names(ctoks: list) -> list:
-    """Return the IDENT tokens declared by a 'Dim ...' statement's code tokens
-    (ctoks[0] is the DIM keyword). Array-dimensioned names (foo(n)) are
-    skipped entirely — never treated as removable."""
-    names: list = []
+def _parse_dim_items(ctoks: list) -> list:
+    """Return (is_array, name_tok, end_offset) for every name declared by a
+    'Dim ...' statement's code tokens (ctoks[0] is the DIM keyword).
+
+    Scalars: end_offset == name_tok.end. Array-dimensioned names (foo(n)):
+    end_offset spans past the matched ')' so callers can reconstruct the
+    exact original declarator text via src[name_tok.start:end_offset] —
+    array dimension expressions are never candidates for removal and must
+    be preserved verbatim if the statement is partially rewritten."""
+    items: list = []
     i = 1
     n = len(ctoks)
     while i < n:
@@ -266,13 +303,55 @@ def _parse_dim_names(ctoks: list) -> list:
                 elif ctoks[k].kind == TokenKind.OP and ctoks[k].value == ')':
                     depth -= 1
                 k += 1
+            items.append((True, t, ctoks[k - 1].end))
             i = k
         else:
-            names.append(t)
+            items.append((False, t, t.end))
             i = j
         if i < n and ctoks[i].kind == TokenKind.OP and ctoks[i].value == ',':
             i += 1
-    return names
+    return items
+
+
+def _parse_const_items(ctoks: list, start: int) -> list:
+    """Return [(name_tok, item_end_offset), ...] for every name declared by a
+    'Const ...' (or 'Public/Private Const ...') statement's code tokens,
+    starting at index *start* (just past the CONST keyword). item_end_offset
+    is the end of that item's RHS expression, so src[name_tok.start:item_end]
+    reconstructs the exact 'name = expr' text — same convention as
+    _parse_dim_items. Paren depth is tracked so a parenthesized expression's
+    internal commas aren't mistaken for item separators. Returns [] on any
+    malformed shape rather than guessing."""
+    items: list = []
+    i = start
+    n = len(ctoks)
+    if i >= n:
+        return []
+    while i < n:
+        if ctoks[i].kind != TokenKind.IDENT:
+            return []  # malformed: bail out rather than guess
+        name_tok = ctoks[i]
+        i += 1
+        if i >= n or not (ctoks[i].kind == TokenKind.OP and ctoks[i].value == '='):
+            return []
+        i += 1  # skip '='
+        rhs_start = i
+        depth = 0
+        while i < n:
+            t = ctoks[i]
+            if t.kind == TokenKind.OP and t.value == '(':
+                depth += 1
+            elif t.kind == TokenKind.OP and t.value == ')':
+                depth -= 1
+            elif t.kind == TokenKind.OP and t.value == ',' and depth == 0:
+                break
+            i += 1
+        if i == rhs_start:
+            return []  # '=' with no RHS: malformed
+        items.append((name_tok, ctoks[i - 1].end))
+        if i < n:
+            i += 1  # skip the comma that ended the inner scan
+    return items
 
 
 def _line_indent(src: str, offset: int) -> str:
@@ -281,22 +360,43 @@ def _line_indent(src: str, offset: int) -> str:
     return prefix if prefix.strip() == '' else ''
 
 
-def _dead_store_edits(src: str, preserve_strings: bool) -> list[tuple[int, int, str]]:
+def _self_contained(name: str, reads_by_name: dict, writer_spans: dict) -> bool:
+    """True if every read of *name* falls inside one of its own writer
+    statements' byte spans — i.e. the value never escapes the chain of
+    statements that write it. A name with zero reads is vacuously
+    self-contained (matches the plain 'never read' case)."""
+    spans = writer_spans.get(name, [])
+    for pos in reads_by_name.get(name, []):
+        if not any(s <= pos < e for s, e in spans):
+            return False
+    return True
+
+
+def _dead_store_edits(src: str, preserve_strings: bool, aggressive: bool = False) -> list[tuple[int, int, str]]:
     """File-global liveness: return edits for assignment/Dim statements whose
     name is never read anywhere else in the file. Statement-based (not
     line-based) so line-continuations and colon-joined statements are handled
     correctly; guarded against names that are only referenced dynamically
     inside a string literal passed to Execute/ExecuteGlobal/Eval/CallByName/
-    GetRef (the tokenizer never sees those as IDENT reads)."""
+    GetRef (the tokenizer never sees those as IDENT reads).
+
+    --aggressive: a name is dead not only when it is never read at all, but
+    also when every read of it is confined to its own writer statements (a
+    self-referential accumulator chain, e.g. `x = x & f()` repeated with no
+    read of x anywhere else) — a self-contained cluster that can never be
+    observed once removed. Off by default, matching the PS analog's
+    -Aggressive-gated 'dead variable cluster' pass."""
     tokens = tokenize(src)
     stmts = split_statements(tokens)
     if not stmts:
         return []
 
     assign_stmts: list[tuple[str, StatementSpan, list]] = []   # (name_upper, stmt, rhs_toks)
-    dim_stmts: list[tuple[StatementSpan, list]] = []            # (stmt, [name_tok, ...])
+    dim_stmts: list[tuple[StatementSpan, list]] = []            # (stmt, [(is_array, name_tok, end_offset), ...])
+    const_stmts: list[tuple[StatementSpan, list]] = []          # (stmt, [(name_tok, item_end_offset), ...])
     lhs_offsets: set[int] = set()
     dim_name_offsets: set[int] = set()
+    const_name_offsets: set[int] = set()
 
     for stmt in stmts:
         ctoks = stmt.code_tokens()
@@ -305,11 +405,25 @@ def _dead_store_edits(src: str, preserve_strings: bool) -> list[tuple[int, int, 
         kw0 = ctoks[0].upper if ctoks[0].kind == TokenKind.IDENT else ''
 
         if kw0 == 'DIM':
-            names = _parse_dim_names(ctoks)
-            for nm in names:
+            items = _parse_dim_items(ctoks)
+            for _, nm, _ in items:
                 dim_name_offsets.add(nm.start)
-            if names:
-                dim_stmts.append((stmt, names))
+            if items:
+                dim_stmts.append((stmt, items))
+            continue
+
+        const_start = None
+        if kw0 == 'CONST':
+            const_start = 1
+        elif (kw0 in ('PUBLIC', 'PRIVATE') and len(ctoks) > 1
+                and ctoks[1].kind == TokenKind.IDENT and ctoks[1].upper == 'CONST'):
+            const_start = 2
+        if const_start is not None:
+            items = _parse_const_items(ctoks, const_start)
+            for nm, _ in items:
+                const_name_offsets.add(nm.start)
+            if items:
+                const_stmts.append((stmt, items))
             continue
 
         idx = 0
@@ -324,16 +438,31 @@ def _dead_store_edits(src: str, preserve_strings: bool) -> list[tuple[int, int, 
         # Anything else (Call, single-line If, bare expression, ...): all of
         # its IDENT tokens fall through to the read-scan below.
 
-    # --- Collect reads: any IDENT token outside recognized LHS/Dim positions ---
-    excluded = lhs_offsets | dim_name_offsets
-    reads: set[str] = set()
+    # --- Collect reads: any IDENT token outside recognized LHS/Dim/Const positions ---
+    excluded = lhs_offsets | dim_name_offsets | const_name_offsets
+    reads_by_name: dict[str, list] = {}
     for t in tokens:
         if t.kind == TokenKind.IDENT and t.upper not in _KW and t.start not in excluded:
-            reads.add(t.upper)
+            reads_by_name.setdefault(t.upper, []).append(t.start)
 
-    all_dim_names: set[str] = {nm.upper for _, names in dim_stmts for nm in names}
+    all_dim_names: set[str] = {nm.upper for _, items in dim_stmts for is_arr, nm, _ in items if not is_arr}
+    const_names: set[str] = {nm.upper for _, items in const_stmts for nm, _ in items}
     assign_names: set[str] = {name for name, _, _ in assign_stmts}
-    dead: set[str] = {n for n in (assign_names | all_dim_names) if n not in reads}
+    candidates = assign_names | all_dim_names | const_names
+
+    if aggressive:
+        writer_spans: dict[str, list] = {}
+        for name, stmt, _ in assign_stmts:
+            writer_spans.setdefault(name, []).append((stmt.start, stmt.end))
+        for stmt, items in dim_stmts:
+            for is_arr, nm, _ in items:
+                if is_arr:
+                    continue
+                writer_spans.setdefault(nm.upper, []).append((stmt.start, stmt.end))
+        dead: set[str] = {n for n in candidates if _self_contained(n, reads_by_name, writer_spans)}
+    else:
+        reads: set[str] = set(reads_by_name)
+        dead = {n for n in candidates if n not in reads}
 
     if not dead:
         return []
@@ -349,23 +478,51 @@ def _dead_store_edits(src: str, preserve_strings: bool) -> list[tuple[int, int, 
     for name, stmt, rhs_toks in assign_stmts:
         if name not in dead:
             continue
-        rhs_start = rhs_toks[0].start if rhs_toks else stmt.end
-        rhs_src = src[rhs_start: stmt.end]
-        if _side_effect_re.search(rhs_src):
+        if _rhs_has_side_effect(rhs_toks, src, stmt.end):
             continue
         if preserve_strings and _is_pure_literal_toks(rhs_toks):
             continue
         edits.append((stmt.start, stmt.end, ''))
 
-    for stmt, names in dim_stmts:
-        live_names = [nm.value for nm in names if nm.upper not in dead]
-        if len(live_names) == len(names):
-            continue  # all live, no change
-        if not live_names:
+    for stmt, items in dim_stmts:
+        live_parts: list[str] = []
+        changed = False
+        for is_arr, nm, end_off in items:
+            if is_arr:
+                live_parts.append(src[nm.start:end_off])   # always keep, verbatim
+            elif nm.upper in dead:
+                changed = True
+            else:
+                live_parts.append(nm.value)
+        if not changed:
+            continue  # nothing dead in this statement, no edit
+        if not live_parts:
             edits.append((stmt.start, stmt.end, ''))
         else:
             indent = _line_indent(src, stmt.start)
-            edits.append((stmt.start, stmt.end, f'{indent}Dim {", ".join(live_names)}'))
+            trailing = src[items[-1][2]: stmt.end]
+            edits.append((stmt.start, stmt.end, f'{indent}Dim {", ".join(live_parts)}{trailing}'))
+
+    # Const declarations are always literal by VBScript grammar, so removing
+    # a dead one is unconditionally safe — not gated by preserve_strings
+    # (which exists to protect assignments whose deadness might be an
+    # artifact of not having run vbs_propagate_constants yet).
+    for stmt, items in const_stmts:
+        live_parts: list[str] = []
+        changed = False
+        for name_tok, item_end in items:
+            if name_tok.upper in dead:
+                changed = True
+            else:
+                live_parts.append(src[name_tok.start:item_end])
+        if not changed:
+            continue
+        if not live_parts:
+            edits.append((stmt.start, stmt.end, ''))
+        else:
+            prefix = src[stmt.start:items[0][0].start]
+            trailing = src[items[-1][1]: stmt.end]
+            edits.append((stmt.start, stmt.end, f'{prefix}{", ".join(live_parts)}{trailing}'))
 
     return edits
 

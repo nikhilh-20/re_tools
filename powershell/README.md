@@ -38,46 +38,6 @@ running a single do-everything tool.
 | Want to apply readable names to garbage identifiers | **PsRename-Variables** |
 | Want to see what an `iex` / `-EncodedCommand` actually runs | **PsAnnotate-Iex** |
 
-### Recommended chain (re-run to a fixpoint)
-
-If the sample uses control-flow flattening (a `while`/`switch` dispatcher), run
-**PsUnflatten-Switch** first — everything downstream assumes real, in-order statements. If it uses
-chained-method or static-call string rebuilding, alternate these to a fixpoint next:
-
-```
-FoldMethodChains → FoldStaticStringCalls → FoldStrings
-```
-
-Each can unblock the other — a `.Replace()` chain's receiver may be a `-f`/`+`/`-join` expression
-only `PsFold-Strings` folds, and a `[string]::Concat(...)` argument may be an instance-method chain
-only `PsFold-MethodChains` folds — so re-run the three together until none of them reports any
-further folds.
-
-Then:
-
-```
-UnwrapTrueIf → RemoveDeadCode → PropagateConstants → FoldArithmetic → FoldCharConcat → ResolveReflection
-→ CollapseBlankLines → DecodeByteArray → InlineBase64
-```
-
-Run **PsUnwrap-TrueIf** first: it collapses `if (205 -eq 205) { ... }`-style always-true wrappers
-down to their body, which turns wrapped junk stores into plain dead stores that
-**PsRemove-DeadCode**'s existing dead-store pass then cleans up. Running them in the other order
-misses opaque-true ifs whose body assigns a variable that *is* read elsewhere — PsRemove-DeadCode
-only ever deletes a whole `if`, so a live store trapped in a true-wrapper is otherwise never freed
-from the wrapper.
-
-**PsStrip-Comments** and **PsCollapse-BlankLines** are cosmetic tail passes — run them last, once
-the transforms have stopped changing anything, and run them in that order (stripping comment lines
-leaves blanks behind for the collapser to squeeze). Put both *before* **PsAnnotate-Iex** where you
-can, so the annotation output is the newest thing in the file; running them after is safe too, as
-PsStrip-Comments preserves annotation markers by design.
-
-Run the block, and repeat it until every pass reports `changed:0`. Each pass exposes constants the
-next one needs (e.g. propagation reveals char codes, char-concat folds them into names,
-reflection resolves the API those names feed). Insert **Strip-Backticks** first if the sample uses
-backtick escaping, and **Expand-Semicolons** first if it is a single packed line.
-
 ### Invocation convention
 
 Every wrapper takes `-InputFile` and `-OutputFile` and prints a compact JSON stats line

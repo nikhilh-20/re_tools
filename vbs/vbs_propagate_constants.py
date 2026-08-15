@@ -31,7 +31,7 @@ import re
 from vbsdeoblib import tokenize, TokenKind, run_tool
 from vbsdeoblib.io import apply_edits, quote_vbs, format_number
 from vbsdeoblib.resolver import resolve_const, Const
-from vbsdeoblib.statements import split_statements
+from vbsdeoblib.statements import split_statements, find_block_end
 
 
 def run(src: str, **_) -> tuple[str, dict]:
@@ -52,6 +52,16 @@ def _const_to_literal(v: Const) -> str:
     return format_number(v)
 
 
+def _is_false_const(v: Const) -> bool:
+    """VBScript falsiness of an already-resolved constant (comparisons here
+    resolve to -1/0, not Python True/False — see vbsdeoblib.resolver)."""
+    if isinstance(v, (int, float)):
+        return v == 0
+    if isinstance(v, str):
+        return v.lower() in ('', 'false', '0')
+    return False
+
+
 def _one_pass(src: str) -> tuple[str, int, int]:
     tokens = tokenize(src)
     stmts  = split_statements(tokens)
@@ -64,7 +74,7 @@ def _one_pass(src: str) -> tuple[str, int, int]:
 
     edits: list[tuple[int, int, str]] = []
 
-    for stmt in stmts:
+    for stmt_i, stmt in enumerate(stmts):
         ctoks = stmt.code_tokens()
         if not ctoks:
             continue
@@ -108,6 +118,18 @@ def _one_pass(src: str) -> tuple[str, int, int]:
 
         if is_block_open:
             _kill_assignments(ctoks, env, killed)
+            if loop_open:
+                # Proactively kill every name this loop's body assigns
+                # anywhere (any nesting depth), *before* any body statement
+                # is substituted. A lazy kill (only when the pass physically
+                # reaches that statement) is too late whenever the loop
+                # reads the name earlier in its body than it rewrites it —
+                # the common read-then-increment/offset-accumulator shape —
+                # which would otherwise fold every in-loop read to whatever
+                # constant was known before the loop ever started.
+                end_i = find_block_end(stmts, stmt_i)
+                if end_i is not None:
+                    _kill_loop_body_assignments(stmts, stmt_i + 1, end_i, env, killed)
             block_kinds.append('LOOP' if loop_open else 'OTHER')
             block_depth += 1
             local_env.clear()
@@ -116,30 +138,46 @@ def _one_pass(src: str) -> tuple[str, int, int]:
         # --- Inside a block body (depth > 0) ---
         if block_depth > 0:
             in_loop = 'LOOP' in block_kinds
-            if _is_assignment(ctoks):
+            # A single-line 'If cond Then stmt' embeds an ordinary statement
+            # after THEN on the same logical line (it never opens a block —
+            # see is_block_open above). Flattening the whole line into one
+            # token stream for substitution would treat that embedded
+            # statement's own assignment target as a read; split at the
+            # top-level THEN so each half gets the rule that actually fits it.
+            then_idx = _find_top_level_then(ctoks) if kw == 'IF' else None
+            if then_idx is not None:
+                merged = env if in_loop else {**env, **local_env}
+                cond_sub = _substitute(ctoks[1:then_idx], merged, edits)
+                cond_val = resolve_const(cond_sub, merged)
+                stmt_part = ctoks[then_idx + 1:]
+                if _is_assignment(stmt_part):
+                    lhs_name, rhs_toks = _split_assignment(stmt_part)
+                    if lhs_name:
+                        # The write is *conditional*: only treat it as
+                        # definitely happening when the guard is statically
+                        # true. A statically-false guard means it never
+                        # happens (env/local_env must stay untouched, not be
+                        # overwritten with the dead branch's value); an
+                        # unresolvable guard means it might or might not
+                        # happen at runtime, so the name must be invalidated
+                        # rather than assumed either unconditionally written
+                        # or unconditionally skipped.
+                        if cond_val is None:
+                            local_env.pop(lhs_name.upper(), None)
+                            killed.add(lhs_name.upper())
+                            env.pop(lhs_name.upper(), None)
+                            _substitute(rhs_toks, merged, edits)
+                        elif _is_false_const(cond_val):
+                            _substitute(rhs_toks, merged, edits)
+                        else:
+                            _apply_inblock_assignment(lhs_name, rhs_toks, env, killed, local_env, in_loop, edits)
+                else:
+                    merged = env if in_loop else {**env, **local_env}
+                    _substitute(stmt_part, merged, edits)
+            elif _is_assignment(ctoks):
                 lhs_name, rhs_toks = _split_assignment(ctoks)
                 if lhs_name:
-                    lhs_up = lhs_name.upper()
-                    # Clear any local knowledge of this name *before*
-                    # substituting RHS so a self-referencing update reads
-                    # only its pre-this-statement value.
-                    local_env.pop(lhs_up, None)
-                    merged = env if in_loop else {**env, **local_env}
-                    # Outer/global env never retains a block-local write —
-                    # matches the original fully-conservative behaviour.
-                    killed.add(lhs_up)
-                    env.pop(lhs_up, None)
-                    rhs_toks_sub = _substitute(rhs_toks, merged, edits)
-                    if not in_loop:
-                        # Straight-line, non-looping block: safe to track
-                        # this as a local constant for later statements in
-                        # the same run (a value computed here executes
-                        # exactly once before any subsequent read of it).
-                        val = resolve_const(rhs_toks_sub, merged)
-                        if val is not None:
-                            local_env[lhs_up] = val
-                    # Inside a loop: never track (a value derived from one
-                    # iteration's inputs is not valid for the next).
+                    _apply_inblock_assignment(lhs_name, rhs_toks, env, killed, local_env, in_loop, edits)
             else:
                 merged = env if in_loop else {**env, **local_env}
                 _substitute(ctoks, merged, edits)
@@ -149,36 +187,105 @@ def _one_pass(src: str) -> tuple[str, int, int]:
         if _is_assignment(ctoks):
             lhs_name, rhs_toks = _split_assignment(ctoks)
             if lhs_name:
-                lhs_up = lhs_name.upper()
-                # Self-append accumulator: VBScript's uninitialized Variant is Empty,
-                # which coerces to "" in a string expression.  When this is provably
-                # the first assignment to the name AND the RHS self-references it
-                # (e.g. X = X & "chunk"), seed it as "" so the whole chain folds.
-                sub_env = env
-                if (lhs_up not in env and lhs_up not in killed
-                        and _is_self_referencing(lhs_up, rhs_toks)):
-                    sub_env = dict(env)
-                    sub_env[lhs_up] = ''
-                # Substitute known constants into the RHS for readability.
-                rhs_toks_sub = _substitute(rhs_toks, sub_env, edits)
-                if lhs_up not in killed:
-                    val = resolve_const(rhs_toks_sub, sub_env)
-                    if val is not None:
-                        env[lhs_up] = val
-                    else:
-                        # RHS not constant — kill the name
-                        killed.add(lhs_up)
-                        env.pop(lhs_up, None)
-                # If lhs is already killed, we still substituted the rhs — nothing more to do.
+                _apply_toplevel_assignment(lhs_name, rhs_toks, env, killed, edits)
             continue
 
-        # Top-level non-assignment: substitute known constants into the reads.
-        _substitute(ctoks, env, edits)
+        # Top-level non-assignment: same single-line-If concern as above —
+        # split at the top-level THEN before substituting.
+        then_idx = _find_top_level_then(ctoks) if kw == 'IF' else None
+        if then_idx is not None:
+            cond_sub = _substitute(ctoks[1:then_idx], env, edits)
+            cond_val = resolve_const(cond_sub, env)
+            stmt_part = ctoks[then_idx + 1:]
+            if _is_assignment(stmt_part):
+                lhs_name, rhs_toks = _split_assignment(stmt_part)
+                if lhs_name:
+                    # See the in-block twin of this branch above: the write
+                    # only definitely happens when the guard is statically
+                    # true; false means it never happens (leave env
+                    # untouched); unresolvable means it might, so the name
+                    # must be invalidated rather than assumed either way.
+                    if cond_val is None:
+                        killed.add(lhs_name.upper())
+                        env.pop(lhs_name.upper(), None)
+                        _substitute(rhs_toks, env, edits)
+                    elif _is_false_const(cond_val):
+                        _substitute(rhs_toks, env, edits)
+                    else:
+                        _apply_toplevel_assignment(lhs_name, rhs_toks, env, killed, edits)
+            else:
+                _substitute(stmt_part, env, edits)
+        else:
+            _substitute(ctoks, env, edits)
 
     if not edits:
         return src, 0, 0
     new_src = apply_edits(src, edits)
     return new_src, len(edits), len(edits)
+
+
+def _find_top_level_then(ctoks: list) -> int | None:
+    """Index of a top-level (not inside parens) THEN keyword, or None."""
+    depth = 0
+    for i, t in enumerate(ctoks):
+        if t.kind == TokenKind.OP and t.value == '(':
+            depth += 1
+        elif t.kind == TokenKind.OP and t.value == ')':
+            depth -= 1
+        elif depth == 0 and t.kind == TokenKind.IDENT and t.upper == 'THEN':
+            return i
+    return None
+
+
+def _apply_toplevel_assignment(lhs_name: str, rhs_toks: list, env: dict,
+                                killed: set, edits: list) -> None:
+    """Shared bookkeeping for a recognised top-level 'name = rhs' —
+    whether it's the whole statement or the tail of a single-line
+    'If cond Then name = rhs'."""
+    lhs_up = lhs_name.upper()
+    # Self-append accumulator: VBScript's uninitialized Variant is Empty,
+    # which coerces to "" in a string expression.  When this is provably
+    # the first assignment to the name AND the RHS self-references it
+    # (e.g. X = X & "chunk"), seed it as "" so the whole chain folds.
+    sub_env = env
+    if (lhs_up not in env and lhs_up not in killed
+            and _is_self_referencing(lhs_up, rhs_toks)):
+        sub_env = dict(env)
+        sub_env[lhs_up] = ''
+    rhs_toks_sub = _substitute(rhs_toks, sub_env, edits)
+    if lhs_up not in killed:
+        val = resolve_const(rhs_toks_sub, sub_env)
+        if val is not None:
+            env[lhs_up] = val
+        else:
+            killed.add(lhs_up)
+            env.pop(lhs_up, None)
+
+
+def _apply_inblock_assignment(lhs_name: str, rhs_toks: list, env: dict, killed: set,
+                               local_env: dict, in_loop: bool, edits: list) -> None:
+    """Shared bookkeeping for a recognised in-block 'name = rhs' —
+    whether it's the whole statement or the tail of a single-line
+    'If cond Then name = rhs' inside an open block."""
+    lhs_up = lhs_name.upper()
+    # Clear any local knowledge of this name *before* substituting RHS so a
+    # self-referencing update reads only its pre-this-statement value.
+    local_env.pop(lhs_up, None)
+    merged = env if in_loop else {**env, **local_env}
+    # Outer/global env never retains a block-local write — matches the
+    # original fully-conservative behaviour.
+    killed.add(lhs_up)
+    env.pop(lhs_up, None)
+    rhs_toks_sub = _substitute(rhs_toks, merged, edits)
+    if not in_loop:
+        # Straight-line, non-looping block: safe to track this as a local
+        # constant for later statements in the same run (a value computed
+        # here executes exactly once before any subsequent read of it).
+        val = resolve_const(rhs_toks_sub, merged)
+        if val is not None:
+            local_env[lhs_up] = val
+    # Inside a loop: never track (a value derived from one iteration's
+    # inputs is not valid for the next).
 
 
 def _kill_assignments(ctoks: list, env: dict, killed: set) -> None:
@@ -191,6 +298,20 @@ def _kill_assignments(ctoks: list, env: dict, killed: set) -> None:
             name = t.value.upper()
             killed.add(name)
             env.pop(name, None)
+
+
+def _kill_loop_body_assignments(stmts: list, start_i: int, end_i: int,
+                                 env: dict, killed: set) -> None:
+    """Kill every name assigned anywhere between statement indices
+    [start_i, end_i) — a loop's full body, any nesting depth — reusing the
+    same 'IDENT immediately followed by =' shape _kill_assignments already
+    uses for block headers. Deliberately a token-shape heuristic rather than
+    a precise assignment parse: it will also kill a name that only appears
+    in a comparison (e.g. the X in 'If X = 5 Then' inside the loop), but
+    over-killing here only costs a missed fold, never produces a wrong
+    substitution — the same trade-off the rest of this tool already makes."""
+    for j in range(start_i, end_i):
+        _kill_assignments(stmts[j].code_tokens(), env, killed)
 
 
 def _leading_skip(ctoks: list) -> int:

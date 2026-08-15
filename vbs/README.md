@@ -15,8 +15,8 @@ technique (or one supporting cleanup), so you chain them by hand.
 | Module | Purpose |
 |---|---|
 | `tokenizer.py` | Hand-rolled VBScript lexer — STRING, NUMBER, IDENT, COMMENT, LINECONT, NEWLINE, COLON, OP, WS, UNKNOWN tokens. String/comment-aware: a `'` or `&` inside a string literal is never mistaken for code. |
-| `resolver.py` | `resolve_const(tokens, env, user_fns)` — shared constant evaluator. Recursive-descent over VBScript expressions: literals, parens, unary/binary operators, and an allowlist of pure builtins (Chr, Replace, Mid, Left, Right, UCase, LCase, Trim, Asc, Len, Space, String, …). Returns `None` on anything unrecognised — callers leave those expressions untouched. |
-| `statements.py` | `split_statements(tokens)` — splits a token stream into logical statement spans, joining `_` line continuations and splitting on `:` outside strings/parens. |
+| `resolver.py` | `resolve_const(tokens, env, user_fns)` — shared constant evaluator. Recursive-descent over VBScript expressions: literals, parens, the full operator set (`& + - * / \ Mod ^`, unary `-`, comparisons `= <> < > <= >=`, and the bitwise/logical operators `And Or Xor Not Eqv Imp`), and an allowlist of pure builtins (Chr, Replace, Mid, Left, Right, UCase, LCase, Trim, Asc, Len, Space, String, …). Returns `None` on anything unrecognised — callers leave those expressions untouched. |
+| `statements.py` | `split_statements(tokens)` — splits a token stream into logical statement spans, joining `_` line continuations and splitting on `:` outside strings/parens. Also `find_block_end(stmts, open_i)` / `opens_block` / `closes_block` — generic For/Do/While/If/Select/With/Function/Sub/Class/Property block matcher, tracking nested blocks of any kind. |
 | `io.py` | `run_tool(fn, …)` — CLI harness: `--input FILE --output FILE [--aggressive]`, reads source, calls `fn(text, **opts) -> (new_text, stats)`, writes output, prints compact JSON stats to stdout. On error: writes `ERROR: …` to output file. |
 
 ---
@@ -31,6 +31,7 @@ technique (or one supporting cleanup), so you chain them by hand.
 | Calls to pure builtins with constant args: `Replace("W@S","@","")`, `Mid("abc",2,1)` | **vbs_fold_builtin_calls** |
 | `Split("a,b,c", ",")` with constant args | **vbs_fold_split_calls** |
 | `accum = ""` / `For i = 0 To UBound(arr)` / `accum = accum & arr(i)` / `Next` over a literal `Array(...)` | **vbs_fold_array_join_loops** |
+| Any `For`/`Do While`/`Do Until`/`While...Wend` loop with a straight-line body over already-constant inputs — rolling-XOR decode loops, custom-alphabet substitution, LCG key schedules, multi-variable byte-decode pipelines, ... | **vbs_fold_constant_loops** |
 | User-defined single-expression wrapper function: `Function ttaffRy(s): ttaffRy = Replace(s,"@","")` | **vbs_inline_functions** |
 | A variable assigned a constant once, then referenced many times | **vbs_propagate_constants** |
 | `If (5 > 3) Then ... End If` always-true wrapper | **vbs_unwrap_trueif** |
@@ -66,6 +67,8 @@ python vbs_fold_chr_calls.py --input sample.vbs --output step1.vbs
 - **vbs_rename_variables** — also `--renames FILE` (required; JSON mapping old names to new).
 - **vbs_extract_variables** — takes **only** `--input`; prints a JSON *report* to stdout and
   writes no output file (analysis-only).
+- **vbs_fold_constant_loops** — also `--max-iterations N` (default 5,000,000), a safety
+  cap on simulated iterations per loop.
 
 ---
 
@@ -223,6 +226,68 @@ Matching is done via `split_statements` + `FOR`/`NEXT` depth tracking (same tech
 `vbs_remove_deadcode`'s local dead-store pass uses), not regex — this pattern spans
 several statements and needs real block-nesting awareness so an unrelated nested `For`
 inside the body is never mistaken for the loop's own closing `Next`.
+
+### vbs_fold_constant_loops
+Generalizes the idea **vbs_fold_array_join_loops** already embodies — a loop
+over statically-known data is computable ahead of time — to arbitrary bounded
+loops (`For`, `Do While`, `Do Until`, `Do...Loop While/Until`, `While...Wend`)
+and arbitrary straight-line bodies of plain assignment statements, not just
+one accumulator over one `Array()` literal. Simulates the body
+statement-by-statement via the shared `resolve_const` evaluator with an
+evolving scalar environment — it has no built-in knowledge of any particular
+algorithm (alphabet, key schedule, XOR key, ...); those are just data it
+evaluates generically, the same way every other fold pass in this toolkit
+works from the shared resolver rather than a per-sample pattern.
+
+Defeats rolling-XOR / custom-alphabet decode loops such as:
+```vbs
+idx = 1 : key = 245
+Do Until idx > Len(enc)
+    hi  = InStr(alphaA, Mid(enc, idx, 1)) - 1
+    lo  = InStr(alphaB, Mid(enc, idx + 1, 1)) - 1
+    b   = (hi * 16) Or lo
+    b   = b Xor key
+    out = out & Chr(b)
+    key = (key * 123 + 161) And 255
+    idx = idx + 2
+Loop
+```
+```vbs
+idx = 1 : key = 245
+hi = ...
+lo = ...
+b = ...
+out = "<decoded literal>"
+key = <final key>
+idx = <final idx>
+```
+
+**Deliberately narrow, decline (leave the loop untouched) on any deviation:**
+- The loop's termination must be provable via `resolve_const` at every step —
+  a condition (or, for `For`, the start/end/step) that fails to resolve
+  aborts the fold.
+- The body must be **straight-line**: no nested `For`/`Do`/`While`/`If`/
+  `Select`/`With`/`Function`/`Sub`/`Class`/`Property`. A loop with a
+  conditional or another loop inside its body is left completely untouched
+  (v1 scope).
+- Every body statement must be a plain `name = expr` (or `Let name = expr`)
+  assignment — a `Call`, method/object invocation, `Set`, or anything else
+  aborts the fold for that loop.
+- Bounded by `--max-iterations` (default 5,000,000) as a safety cap against
+  pathological/adversarial loops; exceeding it aborts only that loop's fold,
+  not the whole run.
+- A variable's value entering the loop is resolved from the nearest preceding
+  top-level constant assignment (same convention `vbs_fold_array_join_loops`
+  uses for `accum`, generalized to every loop-carried variable) — so this
+  tool is designed to run **after** `vbs_fold_builtin_calls`,
+  `vbs_propagate_constants`, and `vbs_fold_concat` in the chain (everything
+  the loop reads from outside itself should already be a literal), and
+  **before** `vbs_remove_deadcode` (which cleans up now-unused inputs, like
+  the alphabet/blob strings, once nothing reads them anymore).
+
+Its coverage is a strict superset of `vbs_fold_array_join_loops`'s narrow
+`For...UBound(Array(...))` pattern; the two are safe to run in either order
+in the same chain (harmless overlap, not a conflict).
 
 ### vbs_inline_functions
 Inlines user-defined single-expression wrapper functions by parameter substitution at

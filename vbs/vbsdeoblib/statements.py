@@ -94,3 +94,61 @@ def split_statements(tokens: list[VbsToken]) -> list[StatementSpan]:
         spans.append(StatementSpan(current))
 
     return spans
+
+
+# ---------------------------------------------------------------------------
+# Generic block matcher
+# ---------------------------------------------------------------------------
+
+_BLOCK_OPENERS = frozenset(['FOR', 'DO', 'WHILE', 'SELECT', 'WITH',
+                             'FUNCTION', 'SUB', 'CLASS', 'PROPERTY'])
+_BLOCK_CLOSERS = frozenset(['NEXT', 'LOOP', 'WEND'])
+
+
+def opens_block(ctoks: list[VbsToken]) -> bool:
+    if not ctoks or ctoks[0].kind != TokenKind.IDENT:
+        return False
+    kw = ctoks[0].upper
+    if kw in _BLOCK_OPENERS:
+        return True
+    if kw == 'IF':
+        # Multi-line 'If ... Then' block header ends with a bare THEN;
+        # single-line 'If c Then stmt' does not open a block.
+        last = ctoks[-1]
+        return last.kind == TokenKind.IDENT and last.upper == 'THEN'
+    return False
+
+
+def closes_block(ctoks: list[VbsToken]) -> bool:
+    if not ctoks or ctoks[0].kind != TokenKind.IDENT:
+        return False
+    kw = ctoks[0].upper
+    if kw in _BLOCK_CLOSERS:
+        return True
+    if kw == 'END':
+        return len(ctoks) > 1 and ctoks[1].kind == TokenKind.IDENT
+    return False
+
+
+def find_block_end(stmts: list[StatementSpan], open_i: int) -> int | None:
+    """Given the index of a statement that opens a block (For/Do/While/
+    Select/With/Function/Sub/Class/Property, or a multi-line 'If ... Then'),
+    return the index of its matching closer (Next/Loop/Wend/End X), tracking
+    nested blocks of any kind so an unrelated nested block's own closer is
+    never mistaken for the outer one's. Returns None if unmatched.
+
+    Caller is responsible for confirming stmts[open_i] is actually a block
+    opener (e.g. via opens_block) — this function starts counting from
+    depth 1 unconditionally, same convention as
+    vbs_fold_array_join_loops._find_matching_next.
+    """
+    depth = 1
+    for j in range(open_i + 1, len(stmts)):
+        ctoks = stmts[j].code_tokens()
+        if opens_block(ctoks):
+            depth += 1
+        elif closes_block(ctoks):
+            depth -= 1
+            if depth == 0:
+                return j
+    return None

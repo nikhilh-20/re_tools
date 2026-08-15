@@ -59,6 +59,11 @@ def _one_pass(src: str, aggressive: bool, preserve_strings: bool,
     # Sub-pass A: statically-false If blocks (no Else)
     edits = _false_if_edits(src)
 
+    # Sub-pass A2: statically-false single-line 'If cond Then stmt' — the
+    # multi-line block regex above can't match these (no End If to anchor on).
+    if not edits:
+        edits = _false_single_line_if_edits(src)
+
     # Sub-pass B: statically-false Do While blocks
     if not edits:
         edits = _false_while_edits(src)
@@ -133,6 +138,46 @@ def _false_while_edits(src: str) -> list[tuple[int, int, str]]:
             region = src[m.start(): m.end()]
             blank = '\n' * region.count('\n')
             edits.append((m.start(), m.end(), blank))
+    return edits
+
+
+def _find_top_level_then(ctoks: list) -> int | None:
+    """Index of a top-level (not inside parens) THEN keyword, or None."""
+    depth = 0
+    for i, t in enumerate(ctoks):
+        if t.kind == TokenKind.OP and t.value == '(':
+            depth += 1
+        elif t.kind == TokenKind.OP and t.value == ')':
+            depth -= 1
+        elif depth == 0 and t.kind == TokenKind.IDENT and t.upper == 'THEN':
+            return i
+    return None
+
+
+def _false_single_line_if_edits(src: str) -> list[tuple[int, int, str]]:
+    """Remove a single-line 'If <always-false-cond> Then <stmt>' entirely.
+    _false_if_edits only matches the multi-line 'If ... Then\\n ... End If'
+    block form (it anchors on a following End If); a one-liner never opens a
+    block at all (see the is_block_open convention used throughout this
+    toolkit — a multi-line If header ends with a bare THEN, a one-liner
+    doesn't), so it needs its own statement-based pass."""
+    tokens = tokenize(src)
+    stmts = split_statements(tokens)
+    edits: list[tuple[int, int, str]] = []
+    for stmt in stmts:
+        ctoks = stmt.code_tokens()
+        if not ctoks or not (ctoks[0].kind == TokenKind.IDENT and ctoks[0].upper == 'IF'):
+            continue
+        last = ctoks[-1]
+        if last.kind == TokenKind.IDENT and last.upper == 'THEN':
+            continue  # multi-line block header — handled by _false_if_edits
+        then_idx = _find_top_level_then(ctoks)
+        if then_idx is None or then_idx == 1:
+            continue  # malformed / no condition tokens
+        cond_toks = ctoks[1:then_idx]
+        val = resolve_const(cond_toks)
+        if val is not None and _falsy(val):
+            edits.append((stmt.start, stmt.end, ''))
     return edits
 
 
@@ -687,15 +732,24 @@ _fn_sub_pat = re.compile(
 
 
 def _unused_func_edits(src: str) -> list[tuple[int, int, str]]:
-    """Return edits that remove Function/Sub definitions whose name is never called."""
+    """Return edits that remove Function/Sub definitions whose name is never
+    called from outside their own body.
+
+    Liveness is judged *per candidate*: an occurrence of a function's name
+    only disqualifies it from removal when that occurrence falls outside the
+    candidate's own [start, end) definition range. A purely self-recursive
+    function (every occurrence of its name is inside its own body) is still
+    correctly eligible for removal — but a call made from a *different*
+    function's body now correctly counts as a real, external use, instead of
+    being invisible just because it happens to sit inside someone else's
+    Function/Sub block (see the toolkit README / bug report for why a
+    single shared "inside any def" exclusion was wrong: it made every
+    function-to-function call invisible, not just self-recursion)."""
     edits: list[tuple[int, int, str]] = []
 
     defs = [(m.group(2).upper(), m.start(), m.end()) for m in _fn_sub_pat.finditer(src)]
     if not defs:
         return edits
-
-    # Build set of byte ranges covered by all definitions
-    def_ranges: list[tuple[int, int]] = [(start, end) for _, start, end in defs]
 
     # Build LHS exclusions (assignment LHS tokens)
     lines = src.splitlines(keepends=True)
@@ -706,28 +760,25 @@ def _unused_func_edits(src: str) -> list[tuple[int, int, str]]:
         if m and m.group(1).upper() not in _KW:
             lhs_byte_offsets.add(line_offsets[li] + m.start(1))
 
-    def in_any_def(offset: int) -> bool:
-        for start, end in def_ranges:
-            if start <= offset < end:
-                return True
-        return False
-
-    # Collect call-site reads: IDENT tokens outside all definition blocks and LHS positions
+    # Every non-LHS occurrence of each candidate name, by name.
     all_tokens = tokenize(src)
-    call_reads: set[str] = set()
+    occurrences_by_name: dict[str, list[int]] = {}
     for tok in all_tokens:
-        if tok.kind == TokenKind.IDENT and tok.upper not in _KW:
-            if tok.start not in lhs_byte_offsets and not in_any_def(tok.start):
-                call_reads.add(tok.upper)
+        if tok.kind == TokenKind.IDENT and tok.upper not in _KW and tok.start not in lhs_byte_offsets:
+            occurrences_by_name.setdefault(tok.upper, []).append(tok.start)
 
-    candidate_names = {fn_name for fn_name, _, _ in defs
-                        if fn_name not in _KW and fn_name not in call_reads}
+    def has_external_occurrence(name: str, own_start: int, own_end: int) -> bool:
+        return any(pos < own_start or pos >= own_end
+                   for pos in occurrences_by_name.get(name, ()))
+
+    candidate_names = {fn_name for fn_name, start, end in defs
+                        if fn_name not in _KW and not has_external_occurrence(fn_name, start, end)}
     # Safety: a name only reachable via a word-boundary match inside a string
     # literal may be dynamically dispatched (Execute/CallByName/GetRef/...).
     stringy_names = _names_referenced_in_strings(all_tokens, candidate_names)
 
     for fn_name, start, end in defs:
-        if fn_name in _KW or fn_name in call_reads or fn_name in stringy_names:
+        if fn_name in _KW or fn_name not in candidate_names or fn_name in stringy_names:
             continue
         region = src[start:end]
         blank = '\n' * region.count('\n')

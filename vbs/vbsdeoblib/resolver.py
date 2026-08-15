@@ -6,6 +6,11 @@ Returns a typed constant (str, int, or float) when the token slice is a
 compile-time-constant expression, or None when it cannot be determined.
 Never raises — the caller treats None as "leave this expression untouched".
 
+Supports the full VBScript operator set: & (concat), + - * / \ Mod ^,
+unary -, comparisons (= <> < > <= >=), and the bitwise/logical operators
+And/Or/Xor/Not/Eqv/Imp (always bitwise; True/False being -1/0 makes logical
+use fall out naturally).
+
 This is the VBS analog of Resolve-Const in _PsDeobLib.ps1: every fold pass
 calls it rather than writing its own per-pattern logic, which keeps every
 tool generic rather than coupled to any one sample's identifiers.
@@ -102,6 +107,36 @@ def _vbs_string(n, c):
     if isinstance(c, int):
         return chr(c) * n
     return str(c)[0] * n
+
+# ---------------------------------------------------------------------------
+# Bitwise/logical and comparison operators.
+# VBScript's And/Or/Xor/Not/Eqv/Imp are always bitwise; "logical" behaviour
+# falls out naturally because True/False are -1/0 (all-bits-set / no-bits-set).
+# Python's &/|/^/~ already implement two's-complement semantics for negative
+# ints, so no manual sign handling is needed.
+# ---------------------------------------------------------------------------
+def _vbs_not(v: Const) -> int:
+    return ~int(_numeric(v))
+
+
+def _vbs_bitop(op: str, a: Const, b: Const) -> int:
+    la, lb = int(_numeric(a)), int(_numeric(b))
+    if op == 'AND': return la & lb
+    if op == 'OR':  return la | lb
+    if op == 'XOR': return la ^ lb
+    if op == 'EQV': return ~(la ^ lb)
+    if op == 'IMP': return (~la) | lb
+    raise ValueError(f'unknown bitwise op {op}')
+
+
+def _vbs_compare(op: str, a: Const, b: Const) -> int:
+    if isinstance(a, str) and isinstance(b, str):
+        left, right = a, b
+    else:
+        left, right = _numeric(a), _numeric(b)   # raises -> caller treats as unresolvable
+    table = {'=': left == right, '<>': left != right, '<': left < right,
+              '>': left > right, '<=': left <= right, '>=': left >= right}
+    return -1 if table[op] else 0
 
 # name.upper() -> (min_args, max_args, fn)
 PURE_BUILTINS: dict[str, tuple[int, int, object]] = {
@@ -200,17 +235,92 @@ class _Parser:
         return result
 
     # ------------------------------------------------------------------
-    # Grammar:  expr -> concat_expr
+    # Grammar (loosest to tightest, matching real VBScript precedence):
+    #           expr        -> imp_expr
+    #           imp_expr    -> eqv_expr ('Imp' eqv_expr)*
+    #           eqv_expr    -> xor_expr ('Eqv' xor_expr)*
+    #           xor_expr    -> or_expr  ('Xor' or_expr)*
+    #           or_expr     -> and_expr ('Or'  and_expr)*
+    #           and_expr    -> not_expr ('And' not_expr)*
+    #           not_expr    -> 'Not' not_expr | compare_expr
+    #           compare_expr -> concat_expr (('='|'<>'|'<'|'>'|'<='|'>=') concat_expr)*
     #           concat_expr -> add_expr ('&' add_expr)*
     #           add_expr    -> mul_expr (('+' | '-') mul_expr)*
     #           mul_expr    -> unary (('*'|'/'|'\'|'Mod') unary)*
-    #           unary       -> '-' unary | 'Not' unary | power
+    #           unary       -> '-' unary | power
     #           power       -> atom ('^' unary)*
     #           atom        -> NUMBER | STRING | '(' expr ')' | call | ident
     # ------------------------------------------------------------------
 
     def _expr(self) -> Const | None:
-        return self._concat()
+        return self._imp()
+
+    def _binop_kw_level(self, kw: str, next_level) -> Const | None:
+        """Shared helper for a left-associative IDENT-keyword binary operator
+        level (And/Or/Xor/Eqv/Imp), all of which resolve via _vbs_bitop."""
+        left = next_level()
+        if left is None:
+            return None
+        while True:
+            t = self._peek()
+            if t is None or not (t.kind == TokenKind.IDENT and t.upper == kw):
+                break
+            self._consume()
+            right = next_level()
+            if right is None:
+                return None
+            try:
+                left = _vbs_bitop(kw, left, right)
+            except Exception:
+                return None
+        return left
+
+    def _imp(self) -> Const | None:
+        return self._binop_kw_level('IMP', self._eqv)
+
+    def _eqv(self) -> Const | None:
+        return self._binop_kw_level('EQV', self._xor)
+
+    def _xor(self) -> Const | None:
+        return self._binop_kw_level('XOR', self._or)
+
+    def _or(self) -> Const | None:
+        return self._binop_kw_level('OR', self._and)
+
+    def _and(self) -> Const | None:
+        return self._binop_kw_level('AND', self._not_expr)
+
+    def _not_expr(self) -> Const | None:
+        t = self._peek()
+        if t is not None and t.kind == TokenKind.IDENT and t.upper == 'NOT':
+            self._consume()
+            v = self._not_expr()
+            if v is None:
+                return None
+            try:
+                return _vbs_not(v)
+            except Exception:
+                return None
+        return self._compare()
+
+    def _compare(self) -> Const | None:
+        left = self._concat()
+        if left is None:
+            return None
+        _CMP_OPS = ('<>', '<=', '>=', '=', '<', '>')
+        while True:
+            t = self._peek()
+            if t is None or not (t.kind == TokenKind.OP and t.value in _CMP_OPS):
+                break
+            op = self._consume().value
+            right = self._concat()
+            if right is None:
+                return None
+            try:
+                left = _vbs_compare(op, left, right)
+            except Exception:
+                return None
+        return left
 
     def _concat(self) -> Const | None:
         left = self._add()
@@ -295,15 +405,6 @@ class _Parser:
                 return None
             try:
                 return -_numeric(v)
-            except Exception:
-                return None
-        if t.kind == TokenKind.IDENT and t.upper == 'NOT':
-            self._consume()
-            v = self._unary()
-            if v is None:
-                return None
-            try:
-                return int(not _truthy(v))  # VBS Not returns integer
             except Exception:
                 return None
         return self._power()
@@ -458,12 +559,6 @@ def _numeric(v: Const) -> int | float:
         return int(v)
     except (ValueError, TypeError):
         return float(str(v))
-
-
-def _truthy(v: Const) -> bool:
-    if isinstance(v, (int, float)):
-        return v != 0
-    return bool(v)
 
 
 # ---------------------------------------------------------------------------

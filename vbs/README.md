@@ -1,6 +1,6 @@
 # VBScript Deobfuscation Toolkit
 
-A field reference for the 18 utilities in this folder. Each is a thin CLI wrapper
+A field reference for the 19 utilities in this folder. Each is a thin CLI wrapper
 over shared library code in `vbsdeoblib/`. Every utility targets **one** obfuscation
 technique (or one supporting cleanup), so you chain them by hand.
 
@@ -33,6 +33,7 @@ technique (or one supporting cleanup), so you chain them by hand.
 | `accum = ""` / `For i = 0 To UBound(arr)` / `accum = accum & arr(i)` / `Next` over a literal `Array(...)` | **vbs_fold_array_join_loops** |
 | Any `For`/`Do While`/`Do Until`/`While...Wend` loop with a straight-line body over already-constant inputs — rolling-XOR decode loops, custom-alphabet substitution, LCG key schedules, multi-variable byte-decode pipelines, ... | **vbs_fold_constant_loops** |
 | User-defined single-expression wrapper function: `Function ttaffRy(s): ttaffRy = Replace(s,"@","")` | **vbs_inline_functions** |
+| Side-effecting accumulator sink: `Function Sink(c): buf = buf & c : End Function` fed by a long run of `Call Sink("chunk")` | **vbs_inline_sink_calls** |
 | A variable assigned a constant once, then referenced many times | **vbs_propagate_constants** |
 | `If (5 > 3) Then ... End If` always-true wrapper | **vbs_unwrap_trueif** |
 | Dead assignments (incl. a var reassigned N times in a row before first use) / always-false `If`/`Do While` blocks / empty-body anti-sandbox loops | **vbs_remove_deadcode** |
@@ -58,8 +59,9 @@ python vbs_fold_chr_calls.py --input sample.vbs --output step1.vbs
 
 ### Exceptions to the two-argument convention
 
-- **vbs_remove_deadcode** — also `--aggressive` (removes unreferenced Function/Sub
-  definitions), `--preserve-strings` (keeps string/number literal RHS assignments
+- **vbs_remove_deadcode** — also `--aggressive` (treats self-referential accumulator
+  chains as dead, e.g. repeated `x = x & f()` never read outside its own writer
+  statements), `--preserve-strings` (keeps string/number literal RHS assignments
   even when dead, as a safety guard for files not yet run through propagation), and
   `--remove-empty-loops` (removes, rather than just flags, empty-body loops whose
   condition contains no parenthesized call).
@@ -300,6 +302,65 @@ End Function
 After inlining, `wrapper("input")` becomes `(<expression with "input" substituted>)`.
 Follow with **vbs_fold_builtin_calls** to fold the materialised call.
 
+### vbs_inline_sink_calls
+Materializes calls to a *side-effecting accumulator* Function/Sub as direct
+self-append assignments. Targets the call-indirected form of the accumulator idiom —
+the payload is built not by `buf = buf & "chunk"` at each site, but by routing every
+chunk through a throwaway procedure whose only effect is that same self-append against
+a **different** global than its own name:
+
+```vbs
+Function Sink(chunk)
+    buf = buf & chunk
+End Function
+Call Sink("first ")
+Call Sink("second")
+```
+```vbs
+buf = buf & ("first ")
+buf = buf & ("second")
+```
+
+Neither neighbouring tool fires on this shape: **vbs_inline_functions** matches only
+`FunctionName = <expr>` (a return value, not a side effect), and
+**vbs_propagate_constants**' self-append seeding never sees a literal
+`buf = buf & "chunk"` to seed because no call site writes `buf` directly.
+
+The rewrite is *semantics-preserving, not a constant fold* — the argument may be any
+expression, and interleaved writes to `buf` from elsewhere keep their ordering — so
+this runs **first** in a chain, before **vbs_propagate_constants** (seeds `buf` as `""`
+and folds the chain), **vbs_fold_concat** (collapses it to one literal), and
+**vbs_remove_deadcode** (drops the superseded intermediate stores).
+
+Detection is by shape alone — the sink name, parameter name, and accumulator name are
+all discovered, never assumed — so it is not tied to any one sample's identifiers.
+Handles `Call Sink(arg)`, bare `Sink(arg)`, bare `Sink arg`, `Sub` as well as
+`Function`, `&` or `+`, `ByVal`/`ByRef` parameters, and colon-joined statements.
+
+Both join directions are recognised, since the mirrored form is the same idiom:
+
+| Body | Call site becomes | Chunk order |
+|---|---|---|
+| `buf = buf & c` (append) | `buf = buf & (arg)` | source order |
+| `buf = c & buf` (prepend) | `buf = (arg) & buf` | reversed |
+
+**Declines (leaves the call untouched) on any deviation**, per the toolkit convention:
+- Body is anything other than exactly one `G = G (&|+) P` statement, where `P` is one
+  of the procedure's own parameters.
+- `G` is the procedure's own name (that's **vbs_inline_functions**' pattern) or is
+  itself a parameter (not a global accumulator).
+- Call-site arity doesn't match the definition's parameter count — emitting
+  `buf & ("a", "b")` would be invalid VBScript, so the call is left alone.
+- A *discarded* argument (one bound to a parameter the body never appends) isn't
+  provably inert — VBScript still evaluates it at the call site, so anything
+  call-shaped means decline. Same guard **vbs_remove_deadcode** applies to `ReDim`
+  bounds.
+- The accumulator name is declared local (`Dim`/`Private`/`Public`/`ReDim`) inside any
+  procedure or class body — inlining would retarget a global write to that local.
+
+For a multi-parameter sink the argument is selected **positionally**, matching the
+parameter the body actually appends.
+
 ### vbs_propagate_constants
 Flow-sensitive constant propagation: walks statements in order, tracks each variable's
 current constant value, and substitutes downstream reads. Kills a variable's tracked
@@ -309,9 +370,67 @@ the LHS is already killed.
 
 **Self-append accumulators**: VBScript's uninitialized `Variant` is `Empty`, which
 coerces to `""` in a string context.  When a variable is encountered for the first
-time as both LHS and an operand of its own RHS (`X = X & "chunk"`), the tool
-automatically seeds it as `""` so the full chain folds in one run.  Follow with
-**vbs_fold_concat** to collapse the resulting `"" & "chunk"` literals.
+time as both LHS and an operand of its own RHS **joined by `&`** (`X = X & "chunk"`,
+or the mirrored `X = "chunk" & X`), the tool automatically seeds it as `""` so the
+full chain folds.
+
+A maximal run of consecutive top-level statements building one variable this way
+(`X = <const>`, then one or more `X = X & <const>` links, with nothing else
+between them) is collapsed into a **single** `X = "<final literal>"` edit, rather
+than substituting `X`'s ever-growing value into every link individually. The
+naive per-link approach makes total edit output grow with the *square* of the
+chain length — one obfuscated sample's 1840-link chain would have required
+substituting a `"..."` literal spanning the entire accumulated-so-far value at
+each of its 1840 reads, ~682 MB of replacement text in total — whereas collapsing
+the whole run costs one edit proportional to the *final* value's length,
+independent of how many links built it. This also means the idiom now resolves
+directly to one literal in this one pass; `vbs_fold_concat` is no longer needed
+to finish it off (though it remains useful for other concat patterns this tool
+doesn't seed).
+
+Collapsing only applies at the top level (see "Inside a block body" below for why
+in-block chains are out of scope) and only extends the run while each link's RHS
+is itself constant-foldable — a link referencing something unresolvable ends the
+run there, and the valid prefix collapses on its own. A separate absolute size
+guard (independent of the tracked-string cap below) stops a *self-squaring* chain
+like `X = X & X`, which doubles the accumulator every link regardless of chain
+length: exponential growth crosses any bound within a handful of doublings, so
+the scan stops almost immediately rather than needing a per-link heuristic.
+
+A collapsed run's resulting value is kept for downstream reads elsewhere in the
+file only if it's under a fixed tracked-value-size cap (8192 chars) — otherwise
+it's dropped, so a second read of the same variable elsewhere doesn't pay to
+re-embed an arbitrarily large literal at that read site too. That same cap also
+still fully governs the fallback path for anything that isn't a clean top-level
+run: ordinary non-chain assignments, and in-block self-append chains.
+
+The seeding is deliberately restricted to `&`, which is the only VBScript operator
+that guarantees string context (it coerces both operands to string, so `Empty` really
+does read as `""`). A `+` self-append is never seeded: `+` *adds* when either operand
+is numeric, and while `Empty + 2` is `2`, `"" + 2` is a runtime type mismatch — so
+seeding a numeric accumulator as `""` would change behaviour rather than reveal it.
+Such an accumulator is simply left symbolic.
+
+**Decoy accumulator seeds**: the self-append seeding above only fires on a variable's
+*first* assignment, so obfuscators defeat it by seeding the accumulator from a bare name
+that is never bound anywhere — `acc = someJunkName` ahead of the chain — which marks
+`acc` as "assigned something unresolvable" and blocks every later fold. VBScript without
+`Option Explicit` auto-declares any unbound name as an Empty Variant, which reads as `""`
+in a string context, so the seed is foldable *provided the name really is never bound*.
+That is proven by a single strict criterion: the name occurs **exactly once** in the
+whole raw source — the read being folded, and nothing else. One test rules out every
+binding route at once, because each needs a second occurrence in the text: an
+assignment/`Dim`/`Const`/`ReDim`, being passed to a procedure (VBScript parameters are
+**ByRef by default**, so the callee can write back through the argument), a `For`/
+`For Each` loop variable, a procedure name or parameter, or an assignment living inside
+an `Execute`/`Eval` string (counted, since occurrences are tallied over raw source text
+including string and comment content). Reserved words, builtins, and the zero-argument
+intrinsics callable with no parentheses (`Rnd`, `Timer`, `Now`, `Err`, `ScriptEngine`,
+`GetLocale`, …) are excluded outright — those are calls, not unbound variables, and a
+call can legally occur exactly once. The whole fallback is disabled for any file using
+`Option Explicit` (an unbound reference is a compile error there, so the fold could never
+describe a real execution) or containing `Execute`/`ExecuteGlobal`/`Eval`/`CallByName`/
+`GetRef` anywhere — the same dynamic-dispatch guard **vbs_remove_deadcode** already uses.
 
 **Inside a block body**, two regimes apply depending on the kind of every block
 currently open. Non-looping blocks (`If`/`Select`/`With`/`Function`/`Sub`/`Class`/
@@ -354,14 +473,28 @@ Default mode:
   lines (a common anti-sandbox stall, e.g. `Do While f.AtEndOfStream <> True / Loop`
   with nothing advancing the stream) are flagged with a marker comment. Off by
   default for removal — such loops are IOC/TTP evidence worth keeping visible.
-- `Dim` declarations: whole line deleted when all declared names are dead;
-  trimmed to keep only live names when partially dead.
+- **Declarations** (`Dim`, `ReDim`, `Private`, `Public` — scalar or array): whole
+  statement deleted when all declared names are dead; trimmed to keep only live
+  names when partially dead. One liveness rule covers all four keywords and both
+  shapes — binding a name is a write, not a read, regardless of syntax. `ReDim`
+  is the exception requiring its own purity guard: since its bounds are runtime
+  expressions (unlike `Dim`'s compile-time-constant bounds), a `ReDim` whose
+  bounds look call-like (e.g. `ReDim x(Setup())`) is left untouched entirely
+  rather than risk deleting a side effect.
+- **Unreferenced `Function`/`Sub` removal**: a definition whose name is never
+  called from outside its own body is removed. Same reachability question as
+  the assignment/declaration liveness above, so it isn't behind `--aggressive` —
+  a function's shape doesn't change what "never read" means.
 - Statically-false `If`/`Do While` blocks removed.
 
 `--preserve-strings`: keep string/number literal RHS assignments even when dead
 (safety guard for files not yet run through `vbs_propagate_constants`).
 
-`--aggressive`: also removes unreferenced `Function`/`Sub` definitions.
+`--aggressive`: treats self-referential accumulator chains (e.g. repeated
+`x = x & f()`, with `x` never read outside its own writer statements) as dead —
+a self-contained cluster that can never be observed once removed. This one
+genuinely redefines what counts as live (`x` *is* read, just only by itself), so
+unlike the two default-mode passes above, it's opt-in.
 
 `--remove-empty-loops`: also *removes* (rather than just flags) empty-body loops,
 but only when the condition contains no parenthesized call (e.g. `f.Read(1)`) — a

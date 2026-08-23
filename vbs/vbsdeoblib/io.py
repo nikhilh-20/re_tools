@@ -21,6 +21,33 @@ from pathlib import Path
 from typing import Callable, Any
 
 
+_BOM_TABLE = [
+    (b'\xff\xfe\x00\x00', 'utf-32-le'),   # must precede utf-16-le: shares its FF FE prefix
+    (b'\x00\x00\xfe\xff', 'utf-32-be'),
+    (b'\xef\xbb\xbf',     'utf-8-sig'),   # codec strips this BOM itself
+    (b'\xff\xfe',         'utf-16-le'),
+    (b'\xfe\xff',         'utf-16-be'),
+]
+
+
+def read_source_text(path) -> str:
+    """Decode a VBS source file, sniffing a BOM to pick the right encoding.
+
+    Obfuscated VBS/HTA drops are sometimes saved as UTF-16 (WScript/cscript
+    doesn't care), which a hardcoded utf-8-sig read silently mangles into
+    NUL-interleaved garbage that no downstream tokenizer can parse — every
+    pass then reports zero changes with no error. Detection is BOM-based
+    only (deterministic); a UTF-16 file without a BOM is still read as
+    UTF-8, same as before this function existed."""
+    data = Path(path).read_bytes()
+    for bom, encoding in _BOM_TABLE:
+        if data.startswith(bom):
+            if encoding == 'utf-8-sig':
+                return data.decode(encoding, errors='replace')
+            return data[len(bom):].decode(encoding, errors='replace')
+    return data.decode('utf-8-sig', errors='replace')
+
+
 def run_tool(
     fn: Callable[..., tuple[str, dict[str, Any]]],
     description: str = '',
@@ -45,21 +72,21 @@ def run_tool(
     kwargs: dict[str, Any] = {k: v for k, v in vars(args).items()
                                if k not in ('input', 'output')}
 
-    src = Path(args.input).read_text(encoding='utf-8-sig', errors='replace')
+    src = read_source_text(args.input)
 
     try:
         new_text, stats = fn(src, **kwargs)
     except Exception:
         msg = f'ERROR: {traceback.format_exc().splitlines()[-1]}'
         if not analysis_only:
-            Path(args.output).write_text(msg, encoding='utf-8')
+            Path(args.output).write_text(msg, encoding='utf-8', newline='')
         print(msg, file=sys.stderr)
         sys.exit(1)
 
     if analysis_only:
         print(json.dumps(stats, indent=2))
     else:
-        Path(args.output).write_text(new_text, encoding='utf-8')
+        Path(args.output).write_text(new_text, encoding='utf-8', newline='')
         stats['input_bytes']  = len(src.encode('utf-8'))
         stats['output_bytes'] = len(new_text.encode('utf-8'))
         stats['output_path']  = str(args.output)

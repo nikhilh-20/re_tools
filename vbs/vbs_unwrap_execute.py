@@ -95,9 +95,7 @@ def _one_pass(src: str) -> tuple[str, int]:
             continue  # would silently change assignment scope — skip
 
         arg_toks = ctoks[1:]
-        ends_with_colon = bool(arg_toks) and arg_toks[-1].kind == TokenKind.COLON
-        if ends_with_colon:
-            arg_toks = arg_toks[:-1]
+        ends_with_colon = stmt.ends_with_colon
         if not arg_toks:
             continue
 

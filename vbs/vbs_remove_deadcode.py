@@ -3,8 +3,15 @@
 Default mode:
   - Liveness-based dead-store removal: assignments to variables never read are
     deleted. Iterates to fixpoint — removing one dead store can expose more.
-  - Dim declarations: whole line deleted when all declared names are dead;
-    trimmed to keep only live names when partially dead.
+  - Declarations (Dim/ReDim/Private/Public, scalar or array): whole statement
+    deleted when all declared names are dead; trimmed to keep only live names
+    when partially dead. ReDim is only treated as a candidate write when its
+    bounds expressions are call-free (see _CALL_LIKE_RE guard) — a bound that
+    may have a side effect keeps the whole statement untouched.
+  - Unreferenced Function/Sub definitions whose name is never called from
+    outside their own body are removed. This is the same reachability
+    question already answered for variables above (never read == never
+    called) — a definition's shape doesn't change what liveness means.
   - Statically-false If/Do While blocks removed.
 
 --preserve-strings:
@@ -12,12 +19,12 @@ Default mode:
   (safety guard for files not yet run through vbs_propagate_constants).
 
 --aggressive:
-  Also removes unreferenced Function/Sub definitions whose name is never called.
-  Also treats self-referential accumulator chains (e.g. `x = x & f()` repeated,
+  Treats self-referential accumulator chains (e.g. `x = x & f()` repeated,
   with x never read outside its own writer statements) as dead: a variable is
   removed if every read of it is confined to its own writer statements, even
   though it "reads itself" on every line. Off by default because it changes
-  what counts as live, not just what counts as reachable.
+  what counts as live, not just what counts as reachable — every read really
+  does exist, so this is a strictly wider notion of "dead" than reachability.
 
 --remove-empty-loops:
   Also removes empty-body Do/While loops whose condition contains no
@@ -83,8 +90,10 @@ def _one_pass(src: str, aggressive: bool, preserve_strings: bool,
     if not edits:
         edits = _dead_store_edits(src, preserve_strings, aggressive)
 
-    # Sub-pass D: unreferenced Function/Sub removal (--aggressive only)
-    if not edits and aggressive:
+    # Sub-pass D: unreferenced Function/Sub removal (default mode — same
+    # reachability question as sub-pass C, just for definitions instead of
+    # variables; it does not redefine liveness, so it isn't --aggressive-gated).
+    if not edits:
         edits = _unused_func_edits(src)
 
     if not edits:
@@ -108,7 +117,7 @@ def _falsy(v) -> bool:
 def _false_if_edits(src: str) -> list[tuple[int, int, str]]:
     edits: list[tuple[int, int, str]] = []
     false_if = re.compile(
-        r'(?im)^[ \t]*If\s+(.+?)\s+Then\s*\r?\n'
+        r'(?im)^[ \t]*If\s+(.+?)\s+Then\s*:?\s*\r?\n'
         r'(?:(?![ \t]*(?:ElseIf|Else\s+If|Else\b|End\s+If))[^\r\n]*\r?\n)*'
         r'[ \t]*End\s+If\b[^\r\n]*',
     )
@@ -126,7 +135,7 @@ def _false_if_edits(src: str) -> list[tuple[int, int, str]]:
 def _false_while_edits(src: str) -> list[tuple[int, int, str]]:
     edits: list[tuple[int, int, str]] = []
     false_while = re.compile(
-        r'(?im)^[ \t]*Do\s+While\s+(.+?)\s*\r?\n'
+        r'(?im)^[ \t]*Do\s+While\s+(.+?)\s*:?\s*\r?\n'
         r'(?:(?![ \t]*Loop)[^\r\n]*\r?\n)*'
         r'[ \t]*Loop\b[^\r\n]*',
     )
@@ -321,40 +330,54 @@ def _is_pure_literal_toks(rhs_toks: list) -> bool:
     return len(rhs_toks) == 1 and rhs_toks[0].kind in (TokenKind.STRING, TokenKind.NUMBER)
 
 
-def _parse_dim_items(ctoks: list) -> list:
-    """Return (is_array, name_tok, end_offset) for every name declared by a
-    'Dim ...' statement's code tokens (ctoks[0] is the DIM keyword).
+def _parse_dim_items(ctoks: list, start: int = 1) -> list:
+    """Return [(is_array, name_tok, end_offset), ...] for every name declared
+    by a Dim/ReDim/Private/Public variable-declaration statement's code
+    tokens, starting at index *start* (just past the leading keyword(s)).
 
     Scalars: end_offset == name_tok.end. Array-dimensioned names (foo(n)):
     end_offset spans past the matched ')' so callers can reconstruct the
-    exact original declarator text via src[name_tok.start:end_offset] —
-    array dimension expressions are never candidates for removal and must
-    be preserved verbatim if the statement is partially rewritten."""
+    exact original declarator text via src[name_tok.start:end_offset] — the
+    bound expression itself is never a removal candidate and must be
+    preserved verbatim if the statement is partially rewritten. Bound
+    commas at any paren depth > 0 are never mistaken for item separators.
+
+    Strict grammar: IDENT ['(' ... ')'] (',' IDENT ['(' ... ')'])* — returns
+    [] on any malformed shape (stray keyword, unbalanced parens, trailing
+    garbage) rather than guessing, same policy as _parse_const_items. This
+    matters beyond Dim: reused for Private/Public declarators, where a
+    non-declaration statement like 'Public Function Foo()' must be rejected
+    outright rather than misread as declaring FUNCTION/Foo as variables."""
     items: list = []
-    i = 1
+    i = start
     n = len(ctoks)
+    if i >= n:
+        return []
     while i < n:
         t = ctoks[i]
-        if t.kind != TokenKind.IDENT:
-            i += 1
-            continue
-        j = i + 1
-        if j < n and ctoks[j].kind == TokenKind.OP and ctoks[j].value == '(':
+        if t.kind != TokenKind.IDENT or t.upper in _KW:
+            return []  # malformed: bail out rather than guess
+        i += 1
+        if i < n and ctoks[i].kind == TokenKind.OP and ctoks[i].value == '(':
             depth = 1
-            k = j + 1
+            k = i + 1
             while k < n and depth > 0:
                 if ctoks[k].kind == TokenKind.OP and ctoks[k].value == '(':
                     depth += 1
                 elif ctoks[k].kind == TokenKind.OP and ctoks[k].value == ')':
                     depth -= 1
                 k += 1
+            if depth != 0:
+                return []  # unbalanced parens: malformed
             items.append((True, t, ctoks[k - 1].end))
             i = k
         else:
             items.append((False, t, t.end))
-            i = j
-        if i < n and ctoks[i].kind == TokenKind.OP and ctoks[i].value == ',':
-            i += 1
+        if i < n:
+            if ctoks[i].kind == TokenKind.OP and ctoks[i].value == ',':
+                i += 1
+            else:
+                return []  # trailing garbage after a declarator: malformed
     return items
 
 
@@ -417,13 +440,35 @@ def _self_contained(name: str, reads_by_name: dict, writer_spans: dict) -> bool:
     return True
 
 
+def _redim_bounds_have_call(items: list, src: str) -> bool:
+    """True if any array declarator's bound expression in a parsed ReDim
+    statement looks call-like (see _CALL_LIKE_RE), e.g. ReDim x(Setup()).
+    Unlike Dim, ReDim bounds are runtime expressions and VBScript grammar
+    does not forbid a call there, so this guard exists for ReDim only.
+    Scans strictly between each declarator's own parens — src[nm.end:end_off]
+    starts right after the name, so the declared name itself can never
+    self-match the leading '(' of its own bounds."""
+    for is_arr, nm, end_off in items:
+        if is_arr and _CALL_LIKE_RE.search(src[nm.end:end_off]):
+            return True
+    return False
+
+
 def _dead_store_edits(src: str, preserve_strings: bool, aggressive: bool = False) -> list[tuple[int, int, str]]:
-    """File-global liveness: return edits for assignment/Dim statements whose
-    name is never read anywhere else in the file. Statement-based (not
-    line-based) so line-continuations and colon-joined statements are handled
-    correctly; guarded against names that are only referenced dynamically
-    inside a string literal passed to Execute/ExecuteGlobal/Eval/CallByName/
-    GetRef (the tokenizer never sees those as IDENT reads).
+    """File-global liveness: return edits for assignment/declaration
+    statements whose name is never read anywhere else in the file.
+    Statement-based (not line-based) so line-continuations and colon-joined
+    statements are handled correctly; guarded against names that are only
+    referenced dynamically inside a string literal passed to
+    Execute/ExecuteGlobal/Eval/CallByName/GetRef (the tokenizer never sees
+    those as IDENT reads).
+
+    Declarations — Dim, ReDim, Private, Public, scalar or array — are all
+    judged by one liveness rule: binding a name is a write, not a read,
+    regardless of syntactic shape. ReDim is the sole exception requiring a
+    purity guard (_redim_bounds_have_call): its bounds are runtime
+    expressions, so a statement with a call-like bound is left untouched
+    entirely rather than risk deleting a side effect.
 
     --aggressive: a name is dead not only when it is never read at all, but
     also when every read of it is confined to its own writer statements (a
@@ -437,10 +482,10 @@ def _dead_store_edits(src: str, preserve_strings: bool, aggressive: bool = False
         return []
 
     assign_stmts: list[tuple[str, StatementSpan, list]] = []   # (name_upper, stmt, rhs_toks)
-    dim_stmts: list[tuple[StatementSpan, list]] = []            # (stmt, [(is_array, name_tok, end_offset), ...])
+    decl_stmts: list[tuple[StatementSpan, list]] = []           # (stmt, [(is_array, name_tok, end_offset), ...])
     const_stmts: list[tuple[StatementSpan, list]] = []          # (stmt, [(name_tok, item_end_offset), ...])
     lhs_offsets: set[int] = set()
-    dim_name_offsets: set[int] = set()
+    decl_name_offsets: set[int] = set()
     const_name_offsets: set[int] = set()
 
     for stmt in stmts:
@@ -450,11 +495,25 @@ def _dead_store_edits(src: str, preserve_strings: bool, aggressive: bool = False
         kw0 = ctoks[0].upper if ctoks[0].kind == TokenKind.IDENT else ''
 
         if kw0 == 'DIM':
-            items = _parse_dim_items(ctoks)
+            items = _parse_dim_items(ctoks, 1)
             for _, nm, _ in items:
-                dim_name_offsets.add(nm.start)
+                decl_name_offsets.add(nm.start)
             if items:
-                dim_stmts.append((stmt, items))
+                decl_stmts.append((stmt, items))
+            continue
+
+        if kw0 == 'REDIM':
+            start = 1
+            if (len(ctoks) > 1 and ctoks[1].kind == TokenKind.IDENT
+                    and ctoks[1].upper == 'PRESERVE'):
+                start = 2
+            items = _parse_dim_items(ctoks, start)
+            if items and not _redim_bounds_have_call(items, src):
+                for _, nm, _ in items:
+                    decl_name_offsets.add(nm.start)
+                decl_stmts.append((stmt, items))
+            # Malformed, or a bound looks call-like: leave the statement
+            # alone entirely — its idents fall through to the read-scan.
             continue
 
         const_start = None
@@ -471,6 +530,18 @@ def _dead_store_edits(src: str, preserve_strings: bool, aggressive: bool = False
                 const_stmts.append((stmt, items))
             continue
 
+        if (kw0 in ('PUBLIC', 'PRIVATE') and len(ctoks) > 1
+                and ctoks[1].kind == TokenKind.IDENT and ctoks[1].upper not in _KW):
+            items = _parse_dim_items(ctoks, 1)
+            if items:
+                for _, nm, _ in items:
+                    decl_name_offsets.add(nm.start)
+                decl_stmts.append((stmt, items))
+                continue
+            # Fails the strict declarator grammar (e.g. 'Public Default
+            # Property Get X') — fall through to the generic read-scan
+            # below, same as any other unrecognized statement shape.
+
         idx = 0
         if ctoks[0].kind == TokenKind.IDENT and ctoks[0].upper in ('SET', 'LET'):
             idx = 1
@@ -483,26 +554,24 @@ def _dead_store_edits(src: str, preserve_strings: bool, aggressive: bool = False
         # Anything else (Call, single-line If, bare expression, ...): all of
         # its IDENT tokens fall through to the read-scan below.
 
-    # --- Collect reads: any IDENT token outside recognized LHS/Dim/Const positions ---
-    excluded = lhs_offsets | dim_name_offsets | const_name_offsets
+    # --- Collect reads: any IDENT token outside recognized LHS/decl/Const positions ---
+    excluded = lhs_offsets | decl_name_offsets | const_name_offsets
     reads_by_name: dict[str, list] = {}
     for t in tokens:
         if t.kind == TokenKind.IDENT and t.upper not in _KW and t.start not in excluded:
             reads_by_name.setdefault(t.upper, []).append(t.start)
 
-    all_dim_names: set[str] = {nm.upper for _, items in dim_stmts for is_arr, nm, _ in items if not is_arr}
+    all_decl_names: set[str] = {nm.upper for _, items in decl_stmts for _, nm, _ in items}
     const_names: set[str] = {nm.upper for _, items in const_stmts for nm, _ in items}
     assign_names: set[str] = {name for name, _, _ in assign_stmts}
-    candidates = assign_names | all_dim_names | const_names
+    candidates = assign_names | all_decl_names | const_names
 
     if aggressive:
         writer_spans: dict[str, list] = {}
         for name, stmt, _ in assign_stmts:
             writer_spans.setdefault(name, []).append((stmt.start, stmt.end))
-        for stmt, items in dim_stmts:
-            for is_arr, nm, _ in items:
-                if is_arr:
-                    continue
+        for stmt, items in decl_stmts:
+            for _, nm, _ in items:
                 writer_spans.setdefault(nm.upper, []).append((stmt.start, stmt.end))
         dead: set[str] = {n for n in candidates if _self_contained(n, reads_by_name, writer_spans)}
     else:
@@ -529,14 +598,19 @@ def _dead_store_edits(src: str, preserve_strings: bool, aggressive: bool = False
             continue
         edits.append((stmt.start, stmt.end, ''))
 
-    for stmt, items in dim_stmts:
+    # Dim/ReDim/Private/Public declarators all rewrite the same way: keep
+    # only the live names, preserving each survivor's exact original text
+    # (including array bounds) verbatim, and the exact leading keyword(s)
+    # via a prefix slice — same convention as the Const path below,
+    # generalized to cover 'ReDim Preserve ' / 'Public ' / 'Private ' too.
+    for stmt, items in decl_stmts:
         live_parts: list[str] = []
         changed = False
         for is_arr, nm, end_off in items:
-            if is_arr:
-                live_parts.append(src[nm.start:end_off])   # always keep, verbatim
-            elif nm.upper in dead:
+            if nm.upper in dead:
                 changed = True
+            elif is_arr:
+                live_parts.append(src[nm.start:end_off])   # verbatim — preserves bounds
             else:
                 live_parts.append(nm.value)
         if not changed:
@@ -544,9 +618,9 @@ def _dead_store_edits(src: str, preserve_strings: bool, aggressive: bool = False
         if not live_parts:
             edits.append((stmt.start, stmt.end, ''))
         else:
-            indent = _line_indent(src, stmt.start)
+            prefix = src[stmt.start:items[0][1].start]
             trailing = src[items[-1][2]: stmt.end]
-            edits.append((stmt.start, stmt.end, f'{indent}Dim {", ".join(live_parts)}{trailing}'))
+            edits.append((stmt.start, stmt.end, f'{prefix}{", ".join(live_parts)}{trailing}'))
 
     # Const declarations are always literal by VBScript grammar, so removing
     # a dead one is unconditionally safe — not gated by preserve_strings

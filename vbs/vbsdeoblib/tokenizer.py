@@ -57,14 +57,25 @@ class VbsToken:
 # Compiled token patterns, tried in order.
 _PATTERNS: list[tuple[TokenKind, re.Pattern[str]]] = [
     # String literal: double-quoted, "" is an escaped quote inside.
-    (TokenKind.STRING,  re.compile(r'"(?:[^"]|"")*"', re.S)),
+    #
+    # Written as runs-of-non-quote separated by literal "" escapes, not as
+    # `"(?:[^"]|"")*"`: that alternation forces the regex engine to choose
+    # between its two branches at every single character of the string body,
+    # which measured out as quadratic — a 32 MB single-line literal took ~17s
+    # to match and a 64 MB one raised MemoryError outright. `[^"]*` instead
+    # consumes an entire non-quote run in one step, so only the (rare) ""
+    # escape sites cost an extra branch; the same 64 MB literal now matches
+    # in well under a tenth of a second. Matches identically on escaped
+    # quotes, empty strings, and unterminated strings (verified).
+    (TokenKind.STRING,  re.compile(r'"[^"]*(?:""[^"]*)*"', re.S)),
     # Line-continuation: must come before OP so a trailing _ isn't tokenised as OP.
     (TokenKind.LINECONT, re.compile(r'_[ \t]*(?=\r?\n|$)')),
     # Number: hex &H, octal &O, or plain decimal (optional trailing type-suffix dDfFsSlLiIuU%).
     (TokenKind.NUMBER,  re.compile(r'&[Hh][0-9A-Fa-f]+|&[Oo][0-7]+|'
                                    r'[0-9]+(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?[dDfFsSlLiIuU%]?')),
-    # Newlines.
-    (TokenKind.NEWLINE, re.compile(r'\r?\n')),
+    # Newlines: CRLF, bare CR (old-Mac style, or a stray duplicate CR before
+    # CRLF — seen in some obfuscated drops), or bare LF.
+    (TokenKind.NEWLINE, re.compile(r'\r\n|\r|\n')),
     # Comments: single-quote style.
     (TokenKind.COMMENT, re.compile(r"'[^\r\n]*")),
     # Statement separator.

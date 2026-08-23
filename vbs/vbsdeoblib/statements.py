@@ -11,6 +11,16 @@ logical VBScript statement.  The splitter respects:
     the statement splitter; callers that need block structure must handle
     them separately.
   - COMMENT and WS tokens are included in the span that owns the line.
+
+Content vs. terminator: a statement's byte range (start/end) includes the
+separator that ended it (NEWLINE or COLON) — edits that delete a statement
+must also delete what ended it. But that separator is not part of the
+statement's *content*: code_tokens() strips it, the same way it already
+strips NEWLINE, so every grammar that inspects code_tokens() (arity checks,
+"last token" checks, declarator parsers) sees the same shape regardless of
+whether the statement was terminated by a colon or a newline. A statement
+that needs to know which terminator it had (to reproduce it verbatim) reads
+StatementSpan.ends_with_colon rather than re-deriving it from code_tokens().
 """
 from __future__ import annotations
 from dataclasses import dataclass, field
@@ -31,9 +41,28 @@ class StatementSpan:
         return self.tokens[-1].end if self.tokens else 0
 
     def code_tokens(self) -> list[VbsToken]:
-        return [t for t in self.tokens
+        """This span's content tokens — WS/COMMENT/NEWLINE/LINECONT stripped,
+        and a trailing COLON (the terminator that ended this statement, see
+        module docstring) stripped as well. A COLON not at the very end (only
+        possible if callers ever hand this a span spanning multiple
+        colon-joined statements) is left alone rather than guessed at."""
+        toks = [t for t in self.tokens
                 if t.kind not in (TokenKind.WS, TokenKind.COMMENT,
                                   TokenKind.NEWLINE, TokenKind.LINECONT)]
+        if toks and toks[-1].kind == TokenKind.COLON:
+            toks = toks[:-1]
+        return toks
+
+    @property
+    def ends_with_colon(self) -> bool:
+        """True if this statement was terminated by ':' rather than a
+        newline/EOF — the one bit of terminator information code_tokens()
+        deliberately discards (see module docstring)."""
+        for t in reversed(self.tokens):
+            if t.kind in (TokenKind.WS, TokenKind.COMMENT):
+                continue
+            return t.kind == TokenKind.COLON
+        return False
 
     def raw(self, src: str) -> str:
         if not self.tokens:

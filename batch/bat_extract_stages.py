@@ -28,6 +28,7 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+from batdeoblib.io import read_source_text
 from batdeoblib.tokenizer import tokenize
 from batdeoblib.statements import parse_script
 from bat_decode_blobs import _collect_known_vars, _B64_RE, _printable_ratio, _MIN_LEN
@@ -101,7 +102,7 @@ def main() -> None:
     ap.add_argument('--outdir', required=True)
     args = ap.parse_args()
 
-    src = Path(args.input).read_text(encoding='utf-8-sig', errors='replace')
+    src = read_source_text(args.input)
     manifest = extract_stages(src, Path(args.outdir))
     print(json.dumps(manifest, indent=2))
 

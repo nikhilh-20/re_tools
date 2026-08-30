@@ -31,6 +31,7 @@ from batdeoblib.env import Env
 
 _EXEC_SINKS = {'POWERSHELL', 'PWSH', 'CMD', 'MSHTA', 'WSCRIPT', 'CSCRIPT', 'RUNDLL32', 'START'}
 _ENC_ARG_RE = re.compile(r'(?i)-e(?:nc(?:odedcommand)?)?\s+([A-Za-z0-9+/=]{8,})')
+_ANNOT_HERE_RE = re.compile(r'\s*rem <<<EXEC PAYLOAD BEGIN>>>')
 
 
 def _strip_exe_suffix(word: str) -> str:
@@ -87,6 +88,12 @@ def annotate_exec(text: str, **_opts) -> tuple[str, dict]:
 
         body = [t for t in step.stmt.tokens if t.kind != TokenKind.NEWLINE]
         insert_at = body[-1].end
+        # Idempotency: don't re-annotate a sink this pass already annotated on
+        # an earlier run -- otherwise the chain never reaches a fixpoint
+        # (annotate adds the block, a later strip-comments trims its prose
+        # line, annotate re-adds it, ...).
+        if _ANNOT_HERE_RE.match(text, insert_at):
+            continue
         comment_lines = ['rem <<<EXEC PAYLOAD BEGIN>>>']
         for line in decoded.splitlines() or ['']:
             comment_lines.append(f'rem > {line}')

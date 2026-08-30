@@ -87,6 +87,25 @@ _LABEL_NAME_RE = re.compile(r'[^\s&|<>()"^%!]+')
 _OP2_RE = re.compile(r'&&|\|\||>>')
 _OP1 = set('&|<>(),;')
 
+# Module-level compiled patterns, matched against the WHOLE source with a `pos`
+# argument -- never against a `src[pos:]` slice. On a multi-MB file with few
+# newlines (a one-line dropper, or very long lines) re-slicing the tail at every
+# `%`/`!`/newline is O(n^2); anchored matching is O(1) per call.
+#
+# NEWLINE recognises a bare `\r` (old-Mac ending) and the leading `\r` of a
+# doubled `\r\r\n` -- the old `\r?\n` matched neither, so `re.match(r'\r?\n',
+# ...)` returned None and `m.end()` raised AttributeError, breaking the "never
+# raises" contract; a `\r\r\n` line-ending yields two NEWLINE tokens (`\r`,
+# then `\r\n`).
+_NL_RE = re.compile(r'\r\n|\r|\n')
+_WS_RUN_RE = re.compile(r'[ \t]+')
+_WS_OPT_RE = re.compile(r'[ \t]*')
+_REM_RE = re.compile(r'(?i)rem(?=[ \t]|\r|\n|$)')
+# Maximal run of ordinary text. Inside quotes only whitespace / newline / " / %
+# / ! break a run; outside quotes the caret and every grammar operator do too.
+_TEXT_RUN_INQ_RE = re.compile(r'[^ \t\r\n"%!]+')
+_TEXT_RUN_OUTQ_RE = re.compile(r'[^ \t\r\n"%!^&|<>(),;]+')
+
 
 def _is_line_start(tokens: list[BatToken]) -> bool:
     """True if the next token would be the first non-WS token on its logical
@@ -102,20 +121,19 @@ def _try_comment(src: str, pos: int, tokens: list[BatToken]) -> BatToken | None:
     """At a statement-start position, recognize `rem ...` or `:: ...` as a
     whole-line COMMENT token. Returns None if this isn't a comment start."""
     n = len(src)
-    m = re.match(r'[ \t]*', src[pos:])
-    lead_ws_end = pos + (m.end() if m else 0)
+    lead_ws_end = _WS_OPT_RE.match(src, pos).end()
 
     # `::` — the classic double-colon comment idiom.
     if src.startswith('::', lead_ws_end):
-        end_m = re.search(r'\r?\n', src[lead_ws_end:])
-        end = lead_ws_end + end_m.start() if end_m else n
+        end_m = _NL_RE.search(src, lead_ws_end)
+        end = end_m.start() if end_m else n
         return BatToken(TokenKind.COMMENT, src[pos:end], pos, end, in_quotes=False)
 
     # `rem` (case-insensitive), followed by WS, EOL, or EOF.
-    rem_m = re.match(r'(?i)rem(?=[ \t]|\r?\n|$)', src[lead_ws_end:])
+    rem_m = _REM_RE.match(src, lead_ws_end)
     if rem_m:
-        end_m = re.search(r'\r?\n', src[lead_ws_end:])
-        end = lead_ws_end + end_m.start() if end_m else n
+        end_m = _NL_RE.search(src, lead_ws_end)
+        end = end_m.start() if end_m else n
         return BatToken(TokenKind.COMMENT, src[pos:end], pos, end, in_quotes=False)
 
     return None
@@ -129,7 +147,19 @@ def tokenize(src: str) -> list[BatToken]:
     n = len(src)
     in_quotes = False
 
+    # Offset of the next line break at/after the current scan position, or n if
+    # none remain. `%VAR%` / `!VAR!` pairs cannot span a line, so the % and !
+    # branches bound their closing-delimiter search by this. Recomputed only
+    # when `pos` crosses it -- once per line, O(n) total -- instead of an
+    # `_NL_RE.search(src, pos)` at every % / ! (O(n^2) on a newline-sparse
+    # multi-MB one-liner).
+    line_end = _NL_RE.search(src, 0)
+    line_end = line_end.start() if line_end else n
+
     while pos < n:
+        if pos >= line_end:
+            m = _NL_RE.search(src, pos)
+            line_end = m.start() if m else n
         ch = src[pos]
         line_start = _is_line_start(tokens)
 
@@ -158,18 +188,16 @@ def tokenize(src: str) -> list[BatToken]:
             pos += 1
             continue
 
-        # --- newline ---
-        if ch in '\r\n':
-            m = re.match(r'\r?\n', src[pos:])
-            end = pos + m.end()
+        # --- newline (\r\n, bare \r, or bare \n; a \r\r\n yields two tokens) ---
+        if ch == '\r' or ch == '\n':
+            end = _NL_RE.match(src, pos).end()
             tokens.append(BatToken(TokenKind.NEWLINE, src[pos:end], pos, end, in_quotes=in_quotes))
             pos = end
             continue
 
         # --- whitespace ---
         if ch in ' \t':
-            m = re.match(r'[ \t]+', src[pos:])
-            end = pos + m.end()
+            end = _WS_RUN_RE.match(src, pos).end()
             tokens.append(BatToken(TokenKind.WS, src[pos:end], pos, end, in_quotes=in_quotes))
             pos = end
             continue
@@ -178,9 +206,9 @@ def tokenize(src: str) -> list[BatToken]:
         if ch == '^' and not in_quotes:
             nxt = src[pos + 1:pos + 2]
             if nxt in ('\r', '\n', ''):
-                m = re.match(r'\r?\n', src[pos + 1:])
+                m = _NL_RE.match(src, pos + 1)
                 if m:
-                    end = pos + 1 + m.end()
+                    end = m.end()
                     tokens.append(BatToken(TokenKind.LINECONT, src[pos:end], pos, end, in_quotes=False))
                     pos = end
                     continue
@@ -215,9 +243,7 @@ def tokenize(src: str) -> list[BatToken]:
                     pos = end
                     continue
             # bare %NAME[:modifier]% — scan for the next single % before a newline
-            nl = re.search(r'\r?\n', src[pos + 1:])
-            search_end = pos + 1 + (nl.start() if nl else n - pos - 1)
-            close = src.find('%', pos + 1, search_end + 1)
+            close = src.find('%', pos + 1, line_end)
             if close == -1:
                 # unmatched lone % -> deleted (empirically verified: expands to "")
                 tokens.append(BatToken(TokenKind.PCT_UNMATCH, '%', pos, pos + 1, in_quotes=in_quotes, inner=''))
@@ -231,9 +257,7 @@ def tokenize(src: str) -> list[BatToken]:
 
         # --- bang (delayed-expansion candidate; interpretation deferred) ---
         if ch == '!':
-            nl = re.search(r'\r?\n', src[pos + 1:])
-            search_end = pos + 1 + (nl.start() if nl else n - pos - 1)
-            close = src.find('!', pos + 1, search_end + 1)
+            close = src.find('!', pos + 1, line_end)
             if close == -1:
                 tokens.append(BatToken(TokenKind.TEXT, '!', pos, pos + 1, in_quotes=in_quotes))
                 pos += 1
@@ -261,18 +285,16 @@ def tokenize(src: str) -> list[BatToken]:
         # var-expansion candidates, and structural boundaries apply inside
         # quotes too). ^ and the grammar operators are special ONLY outside
         # quotes -- inside a quoted string they are ordinary literal text.
-        stop_chars = {' ', '\t', '\r', '\n', '"', '%', '!'}
-        if not in_quotes:
-            stop_chars |= {'^'} | _OP1
-        j = pos
-        while j < n and src[j] not in stop_chars and not (not in_quotes and src.startswith(('&&', '||', '>>'), j)):
-            j += 1
-        if j == pos:
+        # A compiled character class instead of a Python per-char loop, so a
+        # multi-MB literal run is one C-level scan, not millions of iterations.
+        run_re = _TEXT_RUN_INQ_RE if in_quotes else _TEXT_RUN_OUTQ_RE
+        m = run_re.match(src, pos)
+        if m is None:
             tokens.append(BatToken(TokenKind.UNKNOWN, src[pos], pos, pos + 1, in_quotes=in_quotes))
             pos += 1
             continue
-        tokens.append(BatToken(TokenKind.TEXT, src[pos:j], pos, j, in_quotes=in_quotes))
-        pos = j
+        tokens.append(BatToken(TokenKind.TEXT, src[pos:m.end()], pos, m.end(), in_quotes=in_quotes))
+        pos = m.end()
 
     return tokens
 

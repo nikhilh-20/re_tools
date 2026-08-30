@@ -1,7 +1,7 @@
-"""Synthetic 11-pass regression mirroring the cmds.txt pipeline order.
+"""Synthetic 11-pass regression mirroring the recommended pipeline order.
 
 No real file paths — everything runs on an inline VBS source string.
-All five tools from cmds.txt are exercised in their exact sequence:
+All five tools are exercised in their exact sequence:
 
   pass 1  : vbs_remove_deadcode --aggressive
   pass 2  : vbs_propagate_constants

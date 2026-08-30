@@ -51,35 +51,53 @@ def _is_if_stmt(s: Statement) -> bool:
     return _first_word(s) == 'IF'
 
 
-def _compute_reachable(cfg) -> set[int] | None:
+def _compute_reachable(cfg) -> tuple[set[int], dict]:
+    """Statements reachable from statement 0 over fall-through + goto/call edges.
+
+    A goto whose target this pass could not resolve to a literal label
+    (a computed `goto %VAR%`, or a label built by concatenation the folds
+    didn't fully resolve) used to void the ENTIRE analysis. Instead, degrade
+    locally: an unresolved jump could land on ANY label, so every label
+    statement is seeded as a reachability root -- a sound over-approximation
+    (we never guess which label; we assume all of them). Code that is still
+    unreachable under that assumption -- e.g. a block after an unconditional
+    `goto LITERAL` with no inbound edge and no fall-through predecessor -- is
+    genuinely dead and still removed. The dead-store fixpoint only ever
+    shrinks as the reachable set grows, so it stays sound too.
+
+    Returns (reachable_indices, info) where info carries `degraded` and
+    `unresolved_goto_targets`.
+    """
     stmts = cfg.statements
     n = len(stmts)
+    if not n:
+        return set(), {'degraded': False, 'unresolved_goto_targets': 0}
+
     goto_by_index = {g.index: g for g in cfg.gotos}
-    for g in cfg.gotos:
-        if g.target is None:
-            return None   # unresolvable jump target -- refuse the whole analysis
+    unresolved = [g for g in cfg.gotos if g.target is None]
+    label_roots = [li.index for li in cfg.labels.values()] if unresolved else []
 
     reachable: set[int] = set()
-    worklist = [0] if n else []
+    worklist: list[int | None] = [0, *label_roots]
     while worklist:
         idx = worklist.pop()
-        if idx in reachable or idx >= n or idx < 0:
+        if idx is None or idx < 0 or idx >= n or idx in reachable:
             continue
         reachable.add(idx)
         stmt = stmts[idx]
         word = _first_word(stmt)
         g = goto_by_index.get(idx)
-        unconditional_jump = g is not None and word in ('GOTO',)
+        unconditional_jump = g is not None and word == 'GOTO'
         unconditional_exit = word == 'EXIT'
-        conditional_jump = g is not None and word != 'GOTO'   # embedded in `if ...`
 
-        if g is not None and g.target != 'EOF':
+        if g is not None and g.target is not None and g.target != 'EOF':
             worklist.append(cfg.label_index(g.target))
         if unconditional_jump or unconditional_exit:
             continue   # no fallthrough
         if idx + 1 < n:
             worklist.append(idx + 1)
-    return reachable
+    return reachable, {'degraded': bool(unresolved),
+                       'unresolved_goto_targets': len(unresolved)}
 
 
 def remove_deadcode(text: str, *, aggressive: bool = False, **_opts) -> tuple[str, dict]:
@@ -88,27 +106,30 @@ def remove_deadcode(text: str, *, aggressive: bool = False, **_opts) -> tuple[st
     stmts = flatten(tree)
     cfg = build_cfg(tree)
 
-    reachable = _compute_reachable(cfg)
-    if reachable is None:
-        return text, {'changed': 0, 'reason': 'unresolvable goto target -- refused'}
+    reachable, reach_info = _compute_reachable(cfg)
 
     edits: list[tuple[int, int, str]] = []
     changed = 0
     unreachable_removed = 0
     dead_stores_removed = 0
 
-    def blank(s: Statement):
+    def blank(s: Statement) -> bool:
+        """Emit an edit deleting statement *s*'s code; return whether there was
+        anything to delete (an already-empty statement -- a blank line a prior
+        pass left behind -- is not a change, so the pass stays idempotent)."""
         body = [t for t in s.tokens if t.kind != TokenKind.NEWLINE]
         if body:
             edits.append((body[0].start, body[-1].end, ''))
+            return True
+        return False
 
     removed_ids: set[int] = set()
     for idx, s in enumerate(stmts):
         if idx not in reachable:
-            blank(s)
             removed_ids.add(id(s))
-            changed += 1
-            unreachable_removed += 1
+            if blank(s):
+                changed += 1
+                unreachable_removed += 1
 
     # -- dead-store fixpoint over the REACHABLE, non-removed statements --
     live_stmts = [s for i, s in enumerate(stmts) if i in reachable]
@@ -170,9 +191,14 @@ def remove_deadcode(text: str, *, aggressive: bool = False, **_opts) -> tuple[st
     # make dead-store removal actively destructive -- deleting a variable
     # that unambiguously still gets used, just not through batch's own
     # expansion syntax.
+    #
+    # A `set "NAME=VALUE"` statement's OWN quoted text is the assignment, not
+    # a read -- excluded here, or every quoted set would protect its own
+    # target and nothing would ever be removable. A real read of some other
+    # variable inside that VALUE is still a %VAR%/!VAR! token, counted above.
     quoted_blob = '\n'.join(
         t.value for s in live_stmts for t in s.tokens
-        if t.kind == TokenKind.TEXT and t.in_quotes
+        if t.kind == TokenKind.TEXT and t.in_quotes and _first_word(s) != 'SET'
     ).upper()
 
     from collections import Counter
@@ -210,8 +236,7 @@ def remove_deadcode(text: str, *, aggressive: bool = False, **_opts) -> tuple[st
             progress = True
 
     for s in live_stmts:
-        if id(s) in dead_ids:
-            blank(s)
+        if id(s) in dead_ids and blank(s):
             changed += 1
             dead_stores_removed += 1
 
@@ -240,11 +265,17 @@ def remove_deadcode(text: str, *, aggressive: bool = False, **_opts) -> tuple[st
         scan_empty_for(tree)
 
     new_text = apply_edits(text, edits) if edits else text
-    return new_text, {
+    stats = {
         'changed': changed,
         'unreachable_removed': unreachable_removed,
         'dead_stores_removed': dead_stores_removed,
     }
+    if reach_info['degraded']:
+        # An unresolved goto target was over-approximated (every label treated
+        # as a possible landing site) rather than refusing the whole pass.
+        stats['reachability_degraded'] = True
+        stats['unresolved_goto_targets'] = reach_info['unresolved_goto_targets']
+    return new_text, stats
 
 
 if __name__ == '__main__':

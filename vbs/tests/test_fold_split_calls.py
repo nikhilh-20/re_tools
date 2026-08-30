@@ -242,7 +242,7 @@ class TestFoldSplitCallsCli(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 class TestSplitToArrayJoinHandoff(unittest.TestCase):
-    """Verifies the two-tool hand-off that underlies cmds.txt passes 5→6 and
+    """Verifies the two-tool hand-off that underlies recommended-pipeline passes 5→6 and
     9→10: fold_split_calls produces Array(...) which fold_array_join_loops then
     consumes in a For/UBound loop."""
 
@@ -296,7 +296,7 @@ class TestSplitToArrayJoinHandoff(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 class TestPropagateThenSplitHandoff(unittest.TestCase):
-    """Verifies the two-tool hand-off that underlies cmds.txt passes 2→5 and
+    """Verifies the two-tool hand-off that underlies recommended-pipeline passes 2→5 and
     8→9: a bare-identifier Split() argument is NOT folded standalone (no env,
     no source-scanning in resolve_const — see test_non_constant_first_arg_not_folded),
     but propagate_constants inlines the constant text first so fold_split_calls

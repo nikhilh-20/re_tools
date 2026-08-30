@@ -12,7 +12,7 @@ Covers every control flow:
   - Invalidation: reassigning the posvar OR the subject var drops the tracked entry
   - Let-prefixed assignment is recognised and tracked normally
   - stats dict always has changed == folded
-  - Pipeline regression (pass 6 of cmds.txt): 3fefc18c sample → changed==2, folded==2
+  - Pipeline regression (pass 6 of the recommended pipeline): 3fefc18c sample → changed==2, folded==2
 """
 import sys, os
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
@@ -417,7 +417,7 @@ class TestFoldInstrMidCli(unittest.TestCase):
 # Class 8: synthetic pipeline chain — no external file dependency
 # ---------------------------------------------------------------------------
 
-# A synthetic source that exercises all 9 passes from the cmds.txt pipeline.
+# A synthetic source that exercises all 9 passes from the recommended pipeline.
 # blob is assigned from a non-constant call so propagate_constants never
 # substitutes it, which keeps the InStr/Mid patterns intact for pass 6.
 _SYNTH_9PASS_SRC = """\
@@ -437,7 +437,7 @@ WScript.Echo ch2
 
 
 class TestPipelineChain(unittest.TestCase):
-    """Runs the full 9-pass cmds.txt pipeline on a synthetic source and
+    """Runs the full 9-pass recommended pipeline on a synthetic source and
     verifies that fold_instr_mid (pass 6) folds both InStr+Mid pairs."""
 
     def setUp(self):

@@ -33,6 +33,16 @@ from .resolver import eval_arith, ArithError
 
 _COMPOUND_OPS = ('<<=', '>>=', '+=', '-=', '*=', '/=', '%=', '&=', '|=', '^=')
 
+# Stop tracking a variable's value once it grows past this. A genuine embedded
+# blob in one `set "X=..."` is bounded by cmd.exe's ~8 KB line limit; a value
+# this large only arises from a `set "P=%P%<chunk>"` accumulator loop unrolled
+# in simulation (or a `set "X=%X%%X%"` doubling, which crosses any bound within
+# a handful of links). Marking it Unknown past the cap keeps a fold pass from
+# substituting an ever-growing string into every link -- O(n^2) edit text, the
+# blow-up vbs_propagate_constants documents. 1 MiB leaves every real
+# accumulator (bat_fold_for_loops caps at 4096 iterations) comfortably tracked.
+_MAX_TRACKED_VALUE_LEN = 1 << 20
+
 
 def _split_compound_assignment(part: str) -> tuple[str, str, bool]:
     """Split a `set /a` comma-item ('NAME=EXPR' or 'NAME<op>=EXPR') into
@@ -205,6 +215,22 @@ def _apply_set(stmt: Statement, env: Env, pct_env: Env) -> None:
                 env.set_unknown(name)
         return
 
+    # Structural runaway guard, before any expansion: a `set` whose RHS names
+    # its own target 2+ times (`set "X=%X%%X%"`) doubles every evaluation and
+    # crosses any size bound within a handful of links -- refuse to track it
+    # rather than build a gigabyte string just to cap it afterward.
+    _written = _statement_names_written(stmt)
+    if _written:
+        _tgt = next(iter(_written))
+        selfrefs = sum(
+            1 for t in stmt.tokens
+            if t.kind in (TokenKind.PCT_VAR, TokenKind.BANG_CAND)
+            and (t.inner or '').split(':', 1)[0].strip().upper() == _tgt
+        )
+        if selfrefs >= 2:
+            env.set_unknown(_tgt)
+            return
+
     r = _quote_stripped_set_value(stmt, env, pct_env)
     if r is None:
         return
@@ -216,6 +242,8 @@ def _apply_set(stmt: Statement, env: Env, pct_env: Env) -> None:
             # variable outright. Verified empirically: `if defined X` is
             # false immediately after `set "X="`.
             env.unset(name)
+        elif len(expanded.text) > _MAX_TRACKED_VALUE_LEN:
+            env.set_unknown(name)   # runaway accumulator -- stop tracking
         else:
             env.set_known(name, expanded.text)
     else:
@@ -290,6 +318,19 @@ def _walk(nodes: list, env: Env, pct_env: Env) -> Iterator[SimStep]:
             written: set[str] = set()
             for leaf in _flatten_for_names(node.body):
                 written |= _statement_names_written(leaf)
+            # Invalidate every name the block assigns on the LIVE env *before*
+            # walking the body, not only after. A `for` body runs many times
+            # with a different value each iteration, so a `!VAR!` read that
+            # comes earlier in the body than that iteration's write to VAR
+            # (the read-then-accumulate shape, `set "ACC=!ACC!x"`) must not
+            # resolve to VAR's pre-loop value -- yielding the pre-loop value
+            # to bat_propagate_constants / bat_fold_substrings would let them
+            # rewrite the accumulator wrong. %-refs are untouched: they
+            # resolve against block_pct_env (the block-entry snapshot, taken
+            # just above), which is the real cmd.exe behavior. Over-killing a
+            # non-loop `if` body only costs a missed fold, never a wrong one.
+            for name in written:
+                env.set_unknown(name)
             yield from _walk(node.body, env, block_pct_env)
             for name in written:
                 env.set_unknown(name)

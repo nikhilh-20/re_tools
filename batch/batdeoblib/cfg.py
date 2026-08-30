@@ -46,15 +46,21 @@ class ControlFlowGraph:
 
 
 def _normalize_label(raw: str) -> str:
-    return raw.upper().lstrip(':').split()[0] if raw.strip() else ''
+    # `:` / `::` / a colon followed only by whitespace has no label name.
+    parts = raw.upper().lstrip(':').split()
+    return parts[0] if parts else ''
 
 
 def build_cfg(nodes: list['Statement | Block']) -> ControlFlowGraph:
     stmts = flatten(nodes)
     labels: dict[str, LabelInfo] = {}
     for idx, s in enumerate(stmts):
-        if s.is_label():
-            name = _normalize_label(s.code_tokens()[0].inner or '')
+        ct = s.code_tokens()
+        # `:name` -- with or without trailing text, which cmd.exe ignores
+        # (`:loop rest of line` is exactly the label `loop`). is_label() only
+        # accepts the bare form, so key off the leading token directly.
+        if ct and ct[0].kind == TokenKind.LABEL:
+            name = _normalize_label(ct[0].inner or '')
             if name and name not in labels:   # first definition wins, matches cmd.exe
                 labels[name] = LabelInfo(name, s, idx)
 

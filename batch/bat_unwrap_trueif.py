@@ -1,17 +1,19 @@
 #!/usr/bin/env python3
-"""Collapses an `if` statement whose condition is statically TRUE down to
-just its action/body -- the opaque-predicate counterpart to a false
-condition (bat_remove_deadcode.py's job). The Batch analogue of
-PsUnwrap-TrueIf / vbs_unwrap_trueif. Only the unambiguous cases: `defined`,
-`exist`, string equality (`==`), and numeric comparison (EQU/NEQ/LSS/LEQ/
+"""Collapses an `if` statement whose condition is statically decidable down to
+just the branch that actually runs -- the opaque-predicate defeat. The Batch
+analogue of PsUnwrap-TrueIf / vbs_unwrap_trueif (and the statically-false-If
+sub-pass vbs_remove_deadcode carries). Only the unambiguous conditions:
+`defined`, string equality (`==`), and numeric comparison (EQU/NEQ/LSS/LEQ/
 GTR/GEQ), each optionally `/i` (case-insensitive) and/or `not`-negated.
 Complex or unresolvable conditions are left untouched.
 
-Handles both `if` shapes:
-  - same-line, no parens: `if COND action` -> `action` (the statement is
-    rewritten in place).
-  - parenthesized block: `if COND (body) [else (elsebody)]` -> the surviving
-    block's body is lifted out, delimiters and the other branch removed.
+Handles both `if` shapes, for a condition proven TRUE or FALSE:
+  - same-line, no parens: `if COND action`
+      TRUE  -> `action` (statement rewritten in place)
+      FALSE -> statement removed
+  - parenthesized block: `if COND (body) [else (elsebody)]`
+      TRUE  -> `body` lifted out, delimiters + any `else` branch removed
+      FALSE -> `elsebody` lifted out (or the whole thing removed if no else)
     Safe because `(...)` groups are not scope boundaries in Batch (there is
     no block scoping at all outside setlocal/endlocal) -- lifting a block's
     body out changes nothing about where its assignments land.
@@ -177,21 +179,27 @@ def unwrap_trueif(text: str, **_opts) -> tuple[str, dict]:
                     header = _parse_if_header(after_if)
                     if header is not None:
                         truth = _resolve_header(header, env, pct_env, node.in_block)
-                        if truth is True:
+                        if truth in (True, False):
                             # Form B: next sibling is a Block (parenthesized body)
                             if i + 1 < len(nodes) and isinstance(nodes[i + 1], Block):
                                 body_block = nodes[i + 1]
                                 start = node.start
                                 end = body_block.end
                                 skip_to = i + 2
-                                # optional `else (...)` right after -- drop it too
+                                else_block = None
+                                # optional `else (...)` right after
                                 if skip_to < len(nodes) and isinstance(nodes[skip_to], Statement) and \
                                    nodes[skip_to].code_tokens() and \
                                    nodes[skip_to].code_tokens()[0].value.upper() == 'ELSE' and \
                                    skip_to + 1 < len(nodes) and isinstance(nodes[skip_to + 1], Block):
-                                    end = nodes[skip_to + 1].end
+                                    else_block = nodes[skip_to + 1]
+                                    end = else_block.end
                                     skip_to += 2
-                                inner = body_block.raw(text)[1:-1]
+                                if truth is True:
+                                    kept = body_block
+                                else:
+                                    kept = else_block   # may be None -> whole thing removed
+                                inner = kept.raw(text)[1:-1] if kept is not None else ''
                                 edits.append((start, end, inner))
                                 changed += 1
                                 i = skip_to
@@ -200,11 +208,17 @@ def unwrap_trueif(text: str, **_opts) -> tuple[str, dict]:
                                 # Form A: same-line action follows the condition
                                 # tail (after_if[header['end']:]) inside this
                                 # SAME statement.
-                                action_tokens = after_if[header['end']:]
-                                action_text = ''.join(t.value for t in action_tokens).lstrip()
-                                if action_text:
-                                    body_tokens = [t for t in node.tokens if t.kind != TokenKind.NEWLINE]
-                                    edits.append((body_tokens[0].start, body_tokens[-1].end, action_text))
+                                body_tokens = [t for t in node.tokens if t.kind != TokenKind.NEWLINE]
+                                if truth is True:
+                                    action_tokens = after_if[header['end']:]
+                                    action_text = ''.join(t.value for t in action_tokens).lstrip()
+                                    if action_text:
+                                        edits.append((body_tokens[0].start, body_tokens[-1].end, action_text))
+                                        changed += 1
+                                else:
+                                    # condition is false and there is no block --
+                                    # the whole `if COND action` never runs.
+                                    edits.append((body_tokens[0].start, body_tokens[-1].end, ''))
                                     changed += 1
             if isinstance(node, Block):
                 scan(node.body)

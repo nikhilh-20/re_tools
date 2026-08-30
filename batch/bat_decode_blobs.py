@@ -74,9 +74,15 @@ def decode_blobs(text: str, *, mode: str = 'base64', key: int = -1, **_opts) -> 
     candidates = []
     annotations: list[str] = []
 
+    def _already(name: str) -> bool:
+        # idempotency: don't re-append an annotation this pass already added
+        # (the `set` line stays Known every run, so without this the chain
+        # never converges).
+        return f'rem <<<DECODED {name} (' in text
+
     if mode == 'base64':
         for name, val in known.items():
-            if len(val) < _MIN_LEN or not _B64_RE.match(val):
+            if len(val) < _MIN_LEN or not _B64_RE.match(val) or _already(name):
                 continue
             try:
                 raw = base64.b64decode(val, validate=True)
@@ -93,7 +99,7 @@ def decode_blobs(text: str, *, mode: str = 'base64', key: int = -1, **_opts) -> 
         if not (0 <= key <= 255):
             return text, {'changed': 0, 'candidates': [], 'error': '--key required (0-255) for --mode xor-hex'}
         for name, val in known.items():
-            if len(val) < _MIN_LEN or len(val) % 2 != 0 or not _HEX_RE.match(val):
+            if len(val) < _MIN_LEN or len(val) % 2 != 0 or not _HEX_RE.match(val) or _already(name):
                 continue
             raw = bytes(int(val[i:i + 2], 16) ^ key for i in range(0, len(val), 2))
             ratio = _printable_ratio(raw)

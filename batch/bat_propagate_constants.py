@@ -20,7 +20,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from batdeoblib.io import run_tool, apply_edits
 from batdeoblib.tokenizer import tokenize, TokenKind
 from batdeoblib.statements import parse_script
-from batdeoblib.simulate import simulate
+from batdeoblib.simulate import simulate, _statement_names_written
 from batdeoblib.env import Env
 
 
@@ -30,6 +30,11 @@ def propagate_constants(text: str, **_opts) -> tuple[str, dict]:
     changed = 0
 
     for step in simulate(tree, Env()):
+        # a `%P%` on the RHS of `set "P=%P%chunk"` is the accumulator link --
+        # substituting its ever-growing value into every link is O(n^2) edit
+        # text (the blow-up vbs_propagate_constants documents). Leave those to
+        # a dedicated concat/collapse pass.
+        self_targets = _statement_names_written(step.stmt)
         for tok in step.stmt.tokens:
             if tok.kind not in (TokenKind.PCT_VAR, TokenKind.BANG_CAND):
                 continue
@@ -37,6 +42,8 @@ def propagate_constants(text: str, **_opts) -> tuple[str, dict]:
             if ':' in inner:
                 continue   # has a modifier -- bat_fold_substrings/strsub's job
             name = inner
+            if name.strip().upper() in self_targets:
+                continue
             if tok.kind == TokenKind.BANG_CAND and not step.env.delayed_expansion:
                 continue
             resolve_env = step.pct_env if tok.kind == TokenKind.PCT_VAR else step.env

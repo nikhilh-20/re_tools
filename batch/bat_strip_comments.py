@@ -44,10 +44,22 @@ def strip_comments(text: str, *, include_data: bool = False, **_opts) -> tuple[s
     dc_removed = 0
     kept = 0
 
+    in_annotation = False
     for tok in tokens:
         if tok.kind != TokenKind.COMMENT:
             continue
-        if any(marker in tok.value for marker in _ANNOTATION_MARKERS):
+        if _ANNOTATION_MARKERS[0] in tok.value:      # BEGIN
+            in_annotation = True
+            kept += 1
+            continue
+        if _ANNOTATION_MARKERS[1] in tok.value:      # END
+            in_annotation = False
+            kept += 1
+            continue
+        if in_annotation:
+            # the `rem > <decoded payload>` lines an annotation block wraps --
+            # preserve them so the chain reaches a fixpoint instead of
+            # strip-comments and bat_annotate_exec fighting forever.
             kept += 1
             continue
         is_dc = tok.value.lstrip()[:2] == '::'

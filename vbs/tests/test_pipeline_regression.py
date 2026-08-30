@@ -272,10 +272,10 @@ class TestPass3Output(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
-# Synthetic 9-pass pipeline (cmds.txt order) — no external file dependency
+# Synthetic 9-pass pipeline (recommended order) — no external file dependency
 # ---------------------------------------------------------------------------
 
-# The cmds.txt pipeline order is different from the 8-pass cef108df pipeline:
+# The recommended pipeline order is different from the 8-pass cef108df pipeline:
 #   1. vbs_strip_comments
 #   2. vbs_propagate_constants
 #   3. vbs_fold_builtin_calls
@@ -328,7 +328,7 @@ def _run_synth_pipeline(tmp: Path) -> tuple[list[dict], list[Path]]:
 
 
 class TestSynthetic9PassPipeline(unittest.TestCase):
-    """Exercises the cmds.txt 9-pass pipeline order on a synthetic source
+    """Exercises the recommended 9-pass pipeline order on a synthetic source
     with no dependency on any external VBS file."""
 
     def setUp(self):

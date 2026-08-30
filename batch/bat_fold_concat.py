@@ -19,7 +19,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from batdeoblib.io import run_tool, apply_edits
 from batdeoblib.tokenizer import tokenize, TokenKind
 from batdeoblib.statements import parse_script
-from batdeoblib.simulate import simulate
+from batdeoblib.simulate import simulate, _statement_names_written
 from batdeoblib.env import Env
 from batdeoblib.expansion import apply_var_modifier, _split_modifier
 
@@ -70,10 +70,19 @@ def fold_concat(text: str, **_opts) -> tuple[str, dict]:
 
     for step in simulate(tree, Env()):
         toks = step.stmt.tokens
+        # `set "P=%P%chunk"` -- folding the growing %P% into every accumulator
+        # link is O(n^2) edit text. Treat a self-referential read as a run
+        # boundary; a dedicated collapse pass is the right tool for these.
+        self_targets = _statement_names_written(step.stmt)
+
+        def _is_self_ref(t):
+            return (t.kind in (TokenKind.PCT_VAR, TokenKind.BANG_CAND)
+                    and (t.inner or '').split(':', 1)[0].strip().upper() in self_targets)
+
         i = 0
         n = len(toks)
         while i < n:
-            if toks[i].kind not in _FOLDABLE:
+            if toks[i].kind not in _FOLDABLE or _is_self_ref(toks[i]):
                 i += 1
                 continue
             run_start = i
@@ -81,7 +90,7 @@ def fold_concat(text: str, **_opts) -> tuple[str, dict]:
             has_expansion = False
             risky = False   # a resolved (non-literal) piece contains %/! -- see guard below
             j = i
-            while j < n and toks[j].kind in _FOLDABLE:
+            while j < n and toks[j].kind in _FOLDABLE and not _is_self_ref(toks[j]):
                 val = _resolve_one(toks[j], step.env, step.pct_env)
                 if val is None:
                     break

@@ -50,11 +50,13 @@ toolkits.
 | `call set "X=%%!Y!%%"` — reading a variable NAMED by another variable | **bat_resolve_indirection** |
 | A variable assigned once, then referenced many times | **bat_inline_constants** |
 | One variable **reused** to hold a different constant before each use | **bat_propagate_constants** |
-| Opaque-predicate `if` that's always **true**: `if "1"=="1" (...)` | **bat_unwrap_trueif** |
+| Opaque-predicate `if` that's statically **true or false**: `if "1"=="1" (...)`, `if 9==8 (...)` | **bat_unwrap_trueif** |
 | Code order scrambled via a chain of unconditional `goto`s | **bat_unflatten_goto** |
 | A `call :label` subroutine used from exactly one call site | **bat_inline_subroutines** |
-| Dead stores / unreachable code after an unconditional `goto`/`exit` | **bat_remove_deadcode** |
+| Dead stores / unreachable code after an unconditional `goto`/`exit` (degrades locally past a computed `goto %VAR%` instead of refusing) | **bat_remove_deadcode** |
 | A base64 or single-byte-XOR-over-hex blob held in a variable | **bat_decode_blobs** |
+| A payload FILE assembled by `echo <chunk>>>"%F%"` lines, then `certutil -decode`d / fake-PEM-armored | **bat_reconstruct_files** |
+| A polyglot (`<# ::` head) or a foreign script after the batch region's `exit` / `goto :eof` | **bat_split_polyglot** |
 | Want the recovered PowerShell/VBS stage as its own file | **bat_extract_stages** |
 | Want to see what a `powershell`/`cmd`/`mshta`/… sink actually runs | **bat_annotate_exec** |
 | The program itself (not just an argument) is hidden behind a variable | **bat_unwrap_call** |
@@ -88,6 +90,17 @@ Exceptions to the two-argument convention:
   writes no output file.
 - **bat_extract_stages** — takes `--input` and `--outdir` (not `--output`); writes N stage files
   and prints a JSON manifest to stdout. Never executes a recovered stage.
+- **bat_reconstruct_files** — takes `--input` and `--outdir` (not `--output`); reconstructs each
+  file the script assembles with `>`/`>>` redirection, strips fake `-----BEGIN CERTIFICATE-----`
+  armor, and applies the decode the script itself uses (`certutil -decode` / `-decodehex`, or a
+  plain base64/hex body). Writes `reconstructed_N.<ext>` + a JSON manifest. Never executes
+  anything. A file with any unresolvable `echo` chunk is written as `.partial.txt` and never
+  decoded. Run the folding passes first.
+- **bat_split_polyglot** — takes `--input` and `--outdir` (not `--output`); writes
+  `batch_region.cmd` (the cmd-executable prefix) and `stage_trailer.<ext>` (the embedded
+  PowerShell/VBScript) + a JSON manifest. Recognises the `<# ... #>` head-polyglot and any
+  foreign script after the first reachable top-level `exit` / `exit /b` / `goto :eof`. Run it
+  first so the batch passes only see real batch.
 
 ---
 
@@ -862,6 +875,20 @@ Invoke-WebRequest %c2Url%
 ---
 
 ## Verification
+
+Regression tests live in `tests/` (stdlib `unittest`; run `python -m unittest discover -s tests`
+from this folder). They mirror the sibling `vbs/tests/` shape -- inline synthetic sources, each
+`bat_*` driven through its real CLI, assertions on the JSON stats + the output text -- and each
+file's docstring names the bug or edge case it locks down. Highlights: BOM-aware reading and
+newline-preserving writes (`test_io_encoding`, `test_run_tool_newline_write`), bare-`\r` /
+`\r\r\n` tokenizing (`test_tokenizer_newlines`), linear-time tokenizing on multi-MB one-liners
+(`test_tokenizer_perf`), the single-pass `apply_edits` and its nested-edit resolution
+(`test_apply_edits`), loop-body flow sensitivity so a `!ACC!` accumulator read is never folded to
+its pre-loop value (`test_simulate_flow`), an idempotency sweep over every wrapper
+(`test_idempotency_sweep`), and an end-to-end chain run with a reassignment flow trap
+(`test_pipeline_regression`). `run_corpus.py` runs the recommended chain over a directory of real
+samples and reports `%VAR%`-reduction / convergence / recovered-stage metrics with no golden
+outputs, plus `--assert-no-regression baseline.json` for change gating.
 
 The expansion model (`batdeoblib/expansion.py`, `tokenizer.py`, `simulate.py`) is the toolkit's
 foundation, and several of its rules contradict commonly-repeated folklore about cmd.exe. Rather
